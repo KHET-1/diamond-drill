@@ -1,0 +1,14 @@
+# Diamond Drill - Cargo Configuration
+# Optimized for fast iteration on Windows
+
+[build]
+# Isolate test artifacts to prevent linker lock races (LNK1104)
+target-dir = "target"
+
+[alias]
+# Fast test: parallel + live output
+t = "test --lib -- --nocapture --test-threads=8"
+# Full test suite including integration tests
+ta = "test -- --nocapture --test-threads=1"
+# Quick clippy gate
+cl = "clippy -- -D warnings"

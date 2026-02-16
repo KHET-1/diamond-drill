@@ -1,0 +1,170 @@
+[package]
+name = "diamond-drill"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ryan Cashmoney <tunclon@proton.me>"]
+description = "Ultra-fast offline disk image recovery tool - indexes, previews, searches, and exports files with extreme speed and safety"
+license = "MIT"
+repository = "https://github.com/tunclon/diamond-drill"
+keywords = ["recovery", "disk-image", "forensics", "backup", "file-recovery"]
+categories = ["command-line-utilities", "filesystem"]
+
+[features]
+default = ["cli"]
+cli = []
+gui = ["iced", "iced_aw", "dep:rfd"]
+gpu = [
+  "dep:candle-core",
+  "dep:candle-nn",
+  "dep:candle-transformers",
+  "dep:tokenizers",
+  "dep:hf-hub",
+]
+flash-attn = ["gpu", "candle-transformers/flash-attn"]
+
+[[bin]]
+name = "diamond-drill"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = [
+  "full",
+  "fs",
+  "io-util",
+  "sync",
+  "rt-multi-thread",
+] }
+
+# Parallel processing
+rayon = "1.8"
+crossbeam-channel = "0.5"
+
+# CLI
+clap = { version = "4.4", features = [
+  "derive",
+  "color",
+  "suggestions",
+  "wrap_help",
+] }
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+indicatif = { version = "0.17", features = ["rayon", "tokio"] }
+console = "0.15"
+colored = "2.1"
+
+# TUI
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+
+
+# Image processing
+image = { version = "0.24", features = [
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "bmp",
+  "ico",
+  "tiff",
+] }
+turbojpeg = { version = "1.0", optional = true }
+pdf-extract = "0.10"
+
+# Hashing
+blake3 = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# File system & paths
+walkdir = "2.4"
+ignore = "0.4"
+globset = "0.4"
+pathdiff = "0.2"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+toml = "0.8"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+humantime = "2.1"
+
+# Memory mapping (for fast disk reads)
+memmap2 = "0.9"
+
+# File type detection
+infer = "0.15"
+mime_guess = "2.0"
+
+# Human readable sizes
+humansize = "2.1"
+
+# GUI (optional)
+iced = { version = "0.12", optional = true, features = ["tokio", "image"] }
+iced_aw = { version = "0.9", optional = true }
+rfd = { version = "0.15", optional = true }
+
+# UUID for session IDs
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# HTTP client for embedder
+ureq = { version = "2.9", features = ["json"] }
+
+# Additional utilities
+parking_lot = "0.12"
+hex = "0.4"
+num_cpus = "1.16"
+regex = "1.10"
+dirs = "5.0"
+unicode-normalization = "0.1"
+
+# Fuzzy search
+fuzzy-matcher = "0.3"
+nucleo-matcher = "0.3"
+
+# State persistence
+directories = "5.0"
+
+# System info (for proof manifests)
+hostname = "0.4"
+whoami = "1.5"
+opener = "0.7"
+
+# EXIF reading for thumbnail orientation
+kamadak-exif = "0.5"
+
+# GPU Embedding (optional, requires CUDA toolkit)
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.20", optional = true }
+hf-hub = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3.9"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
+tokio-test = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[[bench]]
+name = "indexing"
+harness = false
