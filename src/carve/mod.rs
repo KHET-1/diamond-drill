@@ -351,6 +351,11 @@ impl Carver {
     }
 
     /// Scan a chunk of the mmap for file headers. Returns (offset, signature_index) pairs.
+    ///
+    /// When sector_aligned=true, the main loop steps by 512 bytes for offset-0
+    /// signatures. For offset-based signatures (ftyp at +4, ustar at +257,
+    /// CD001 at +32769), we probe at `pos + header_offset` from each sector
+    /// boundary so files starting at sector boundaries are always found.
     fn scan_chunk(&self, data: &[u8], start: usize, end: usize) -> Vec<(u64, usize)> {
         let mut hits = Vec::new();
         let step = if self.options.sector_aligned { 512 } else { 1 };
@@ -364,35 +369,30 @@ impl Carver {
         while pos < end {
             // Fast path: first-byte index lookup for signatures at offset 0
             let byte = data[pos];
-            let mut matched_at_pos = false;
             for &sig_idx in &self.first_byte_index[byte as usize] {
                 let sig = &self.signatures[sig_idx];
                 let header_end = pos + sig.header.len();
                 if header_end <= data.len() && data[pos..header_end] == *sig.header {
                     hits.push((pos as u64, sig_idx));
-                    matched_at_pos = true;
                     break;
                 }
             }
 
-            // Check offset-based signatures (e.g. MP4 ftyp at offset 4).
-            // These fire when we're at the header_offset position, so the
-            // actual file starts at pos - offset.
-            if !self.offset_sigs.is_empty() {
-                for &(sig_idx, hdr_off) in &self.offset_sigs {
-                    if pos < hdr_off {
-                        continue;
-                    }
-                    let file_start = pos - hdr_off;
-                    let sig = &self.signatures[sig_idx];
-                    let header_end = pos + sig.header.len();
-                    if header_end <= data.len() && data[pos..header_end] == *sig.header {
-                        // Avoid duplicate: skip if we already recorded a hit at file_start
-                        let dominated = matched_at_pos && file_start == pos;
-                        let dup = hits.iter().any(|&(o, _)| o == file_start as u64);
-                        if !dominated && !dup {
-                            hits.push((file_start as u64, sig_idx));
-                        }
+            // For offset-based signatures, probe at pos + header_offset.
+            // This means: "if a file starts at `pos`, check whether its magic
+            // bytes at `pos + hdr_off` match." This correctly finds MP4 (ftyp
+            // at +4), TAR (ustar at +257), and ISO (CD001 at +32769) when the
+            // file starts at a sector boundary.
+            for &(sig_idx, hdr_off) in &self.offset_sigs {
+                let probe = pos + hdr_off;
+                if probe + self.signatures[sig_idx].header.len() > data.len() {
+                    continue;
+                }
+                let sig = &self.signatures[sig_idx];
+                if data[probe..probe + sig.header.len()] == *sig.header {
+                    let file_start = pos as u64;
+                    if !hits.iter().any(|&(o, _)| o == file_start) {
+                        hits.push((file_start, sig_idx));
                     }
                 }
             }
@@ -416,6 +416,9 @@ impl Carver {
         next_header: Option<u64>,
     ) -> Option<u64> {
         let start = offset as usize;
+        if start >= data.len() {
+            return None;
+        }
         let max_end = (start as u64 + sig.max_size).min(data.len() as u64) as usize;
 
         // 1. Internal size parser (most precise, uses format-specific fields)
@@ -464,6 +467,9 @@ impl Carver {
         next_header: Option<u64>,
     ) -> BoundaryMethod {
         let start = offset as usize;
+        if start >= data.len() {
+            return BoundaryMethod::MaxSizeCap;
+        }
         let max_end = (start as u64 + sig.max_size).min(data.len() as u64) as usize;
         let slice_full = &data[start..max_end];
 
@@ -751,6 +757,31 @@ mod tests {
         data[100] = 0xFF; data[101] = 0xD8; data[102] = 0xFF; // JPEG at byte 100, not aligned
         let hits = c.scan_chunk(&data, 0, data.len());
         assert!(hits.is_empty(), "Sector-aligned scan should skip byte 100");
+    }
+
+    #[test]
+    fn scenario_4_sector_aligned_finds_mp4_ftyp() {
+        let c = carver_default();
+        let mut data = vec![0u8; 2048];
+        // MP4 file starting at sector 0: ftyp box at offset 4
+        // box_size(4) + "ftyp"(4) + brand(4) = typical ftyp header
+        data[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x1C]); // box size 28
+        data[4..8].copy_from_slice(b"ftyp");
+        data[8..12].copy_from_slice(b"isom");
+        let hits = c.scan_chunk(&data, 0, data.len());
+        let mp4_hit = hits.iter().find(|&&(off, _)| off == 0);
+        assert!(mp4_hit.is_some(), "Should find MP4 at sector 0 via ftyp probe at byte 4");
+    }
+
+    #[test]
+    fn scenario_4_sector_aligned_finds_tar() {
+        let c = carver_default();
+        let mut data = vec![0u8; 2048];
+        // TAR file starting at sector 0: "ustar" at offset 257
+        data[257..262].copy_from_slice(b"ustar");
+        let hits = c.scan_chunk(&data, 0, data.len());
+        let tar_hit = hits.iter().find(|&&(off, _)| off == 0);
+        assert!(tar_hit.is_some(), "Should find TAR at sector 0 via ustar probe at byte 257");
     }
 
     #[test]
