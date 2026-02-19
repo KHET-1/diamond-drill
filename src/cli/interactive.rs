@@ -10,6 +10,7 @@ use console::Term;
 use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::carve::{CarveOptions, Carver};
 use crate::cli::InteractiveArgs;
 use crate::core::DrillEngine;
 use crate::export::ExportOptions;
@@ -47,6 +48,9 @@ pub async fn run_interactive_session(args: &InteractiveArgs) -> Result<()> {
             SessionState::Export => {
                 session.export_files().await?;
             }
+            SessionState::Carve => {
+                session.carve_image().await?;
+            }
             SessionState::Exit => {
                 break;
             }
@@ -67,8 +71,7 @@ fn print_interactive_banner() {
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  💎 DIAMOND DRILL - Interactive Recovery Mode                                ║
 ║                                                                              ║
-║  Commands: [/] Search  [f] Filter  [p] Preview  [x] Export  [q] Quit        ║
-║            [Space] Select  [Enter] Confirm  [Tab] Next pane  [?] Help       ║
+║  [/] Search  [f] Filter  [p] Preview  [x] Export  [c] Carve  [q] Quit      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 "#;
     println!("{}", banner.bright_cyan());
@@ -82,6 +85,7 @@ enum SessionState {
     Search,
     Preview,
     Export,
+    Carve,
     Exit,
 }
 
@@ -237,6 +241,7 @@ impl InteractiveSession {
             "📋 Select None",
             "📤 Export Selected",
             "👁  Preview Selected",
+            "💎 Carve Raw Image",
             "🚪 Exit",
             "──────────────────────────",
         ];
@@ -262,38 +267,24 @@ impl InteractiveSession {
             .interact_opt()?;
 
         match selection {
-            Some(1) => {
-                // Search/Filter
-                self.state = SessionState::Search;
-            }
-            Some(2) => {
-                // Select All
-                self.selected_files = files;
-            }
-            Some(3) => {
-                // Select None
-                self.selected_files.clear();
-            }
+            Some(1) => self.state = SessionState::Search,
+            Some(2) => self.selected_files = files,
+            Some(3) => self.selected_files.clear(),
             Some(4) => {
-                // Export
                 if self.selected_files.is_empty() {
                     println!("{}", "No files selected!".yellow());
                 } else {
                     self.state = SessionState::Export;
                 }
             }
-            Some(5) => {
-                // Preview
-                self.state = SessionState::Preview;
-            }
-            Some(6) => {
-                // Exit
+            Some(5) => self.state = SessionState::Preview,
+            Some(6) => self.state = SessionState::Carve,
+            Some(7) => {
                 self.state = SessionState::Exit;
                 return Ok(false);
             }
-            Some(idx) if idx >= 8 => {
-                // Toggle file selection
-                let file_idx = idx - 8;
+            Some(idx) if idx >= 9 => {
+                let file_idx = idx - 9;
                 if file_idx < files.len() {
                     let file = &files[file_idx];
                     if self.selected_files.contains(file) {
@@ -447,9 +438,166 @@ impl InteractiveSession {
         Ok(())
     }
 
+    async fn carve_image(&mut self) -> Result<()> {
+        println!(
+            "\n{} {}\n",
+            "💎".bright_cyan(),
+            "Carve Raw Disk Image".bright_yellow().bold()
+        );
+        println!("  Scan a raw disk image (dd, img, iso) for file signatures.\n");
+
+        let source: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Path to disk image")
+            .interact_text()?;
+
+        let source_path = PathBuf::from(&source);
+        if !source_path.exists() {
+            println!("{} Image not found: {}", "✗".bright_red(), source);
+            self.state = SessionState::Browse;
+            return Ok(());
+        }
+
+        let output: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Output folder for carved files")
+            .with_initial_text("./carved")
+            .interact_text()?;
+
+        let dry_run = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Dry run first? (scan only, don't extract)")
+            .default(true)
+            .interact()?;
+
+        let image_size = std::fs::metadata(&source_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        println!(
+            "\n  Image: {} ({})",
+            source,
+            humansize::format_size(image_size, humansize::BINARY),
+        );
+        println!("  Output: {}", output);
+        println!(
+            "  Mode: {}\n",
+            if dry_run { "scan only" } else { "extract" }
+        );
+
+        let pb = ProgressBar::new(image_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")
+                .unwrap()
+                .progress_chars("█▓▒░"),
+        );
+        pb.set_message("Scanning for signatures...");
+
+        let opts = CarveOptions {
+            source: source_path,
+            output_dir: PathBuf::from(&output),
+            sector_aligned: true,
+            min_size: 512,
+            file_types: None,
+            workers: num_cpus::get(),
+            dry_run,
+            verify: !dry_run,
+        };
+
+        let carver = Carver::new(opts);
+        let (carved, result) = carver
+            .carve_with_progress(|progress| {
+                use crate::carve::CarveProgress;
+                match progress {
+                    CarveProgress::ScanComplete { headers_found } => {
+                        pb.finish_with_message(format!("{} headers found", headers_found));
+                    }
+                    CarveProgress::Extracting { current, total, ref extension } => {
+                        if current == 1 {
+                            pb.reset();
+                            pb.set_length(total as u64);
+                            pb.set_style(
+                                ProgressStyle::default_bar()
+                                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                                    .unwrap()
+                                    .progress_chars("█▓▒░"),
+                            );
+                        }
+                        pb.set_position(current as u64);
+                        pb.set_message(format!(".{}", extension));
+                    }
+                    CarveProgress::Done => {
+                        pb.finish_and_clear();
+                    }
+                    _ => {}
+                }
+            })
+            .await?;
+
+        println!("\n{}", "═".repeat(50).bright_cyan());
+        println!(
+            "  {} {} files found, {} {}",
+            "✓".bright_green().bold(),
+            result.files_found,
+            result.files_extracted,
+            if dry_run { "would be extracted" } else { "extracted" },
+        );
+        if result.files_verified > 0 {
+            println!("  {} {} verified", "✓".bright_green(), result.files_verified);
+        }
+        println!(
+            "  {} {}",
+            "📊",
+            humansize::format_size(result.total_bytes_extracted, humansize::BINARY),
+        );
+        if result.duration_ms > 0 {
+            let speed = result.image_size * 1000 / result.duration_ms.max(1);
+            println!(
+                "  {} {:.1}s ({}/s)",
+                "⏱ ",
+                result.duration_ms as f64 / 1000.0,
+                humansize::format_size(speed, humansize::BINARY),
+            );
+        }
+        if !result.by_type.is_empty() {
+            let mut types: Vec<_> = result.by_type.iter().collect();
+            types.sort_by(|a, b| b.1.cmp(a.1));
+            for (ext, count) in types {
+                println!("    {} .{}: {}", "•".bright_cyan(), ext, count);
+            }
+        }
+        println!("{}", "═".repeat(50).bright_cyan());
+
+        if dry_run && !carved.is_empty() {
+            if Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Extract these files for real?")
+                .default(true)
+                .interact()?
+            {
+                let extract_opts = CarveOptions {
+                    source: PathBuf::from(&source),
+                    output_dir: PathBuf::from(&output),
+                    sector_aligned: true,
+                    min_size: 512,
+                    file_types: None,
+                    workers: num_cpus::get(),
+                    dry_run: false,
+                    verify: true,
+                };
+                let extract_carver = Carver::new(extract_opts);
+                let (_, extract_result) = extract_carver.carve().await?;
+                println!(
+                    "\n{} Extracted {} files to {}",
+                    "✓".bright_green().bold(),
+                    extract_result.files_extracted,
+                    output,
+                );
+            }
+        }
+
+        self.state = SessionState::Browse;
+        Ok(())
+    }
+
     async fn persist_state(&self) -> Result<()> {
-        // Save session state to disk for resume
-        // Implementation: serialize selected files, filter, etc.
         Ok(())
     }
 }

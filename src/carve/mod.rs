@@ -174,6 +174,17 @@ impl Carver {
 
         anyhow::ensure!(image_size > 0, "Image file is empty");
 
+        tracing::info!(
+            source = %source.display(),
+            image_size,
+            signatures = self.signatures.len(),
+            workers = self.options.workers,
+            sector_aligned = self.options.sector_aligned,
+            min_size = self.options.min_size,
+            dry_run = self.options.dry_run,
+            "Starting file carve"
+        );
+
         let mmap = Arc::new(unsafe {
             memmap2::Mmap::map(&file)
                 .with_context(|| format!("Failed to mmap image: {}", source.display()))?
@@ -188,7 +199,8 @@ impl Carver {
         let max_header_len = self.signatures.iter().map(|s| s.header.len() + s.header_offset).max().unwrap_or(16);
         let overlap = max_header_len.max(512);
 
-        // Phase 1: parallel scan with progress tracking
+        tracing::debug!(num_chunks, chunk_size, overlap, "Scan chunking configured");
+
         let scan_progress = Arc::new(AtomicU64::new(0));
 
         let sp = Arc::clone(&scan_progress);
@@ -215,6 +227,12 @@ impl Carver {
         }
         hits.sort_by_key(|&(offset, _)| offset);
         hits.dedup_by_key(|h| h.0);
+
+        tracing::info!(
+            headers_found = hits.len(),
+            scan_ms = start.elapsed().as_millis() as u64,
+            "Signature scan complete"
+        );
 
         on_progress(CarveProgress::ScanComplete { headers_found: hits.len() });
 
@@ -291,7 +309,13 @@ impl Carver {
                 );
                 let out_path = self.options.output_dir.join(&filename);
                 if let Err(e) = std::fs::write(&out_path, data) {
-                    tracing::warn!("Failed to write carved file {}: {}", out_path.display(), e);
+                    tracing::warn!(
+                        path = %out_path.display(),
+                        error = %e,
+                        offset = cf.offset,
+                        size = cf.size,
+                        "Failed to write carved file"
+                    );
                     result.files_failed += 1;
                     continue;
                 }
@@ -307,6 +331,17 @@ impl Carver {
 
         on_progress(CarveProgress::Done);
         result.duration_ms = start.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            files_found = result.files_found,
+            files_extracted = result.files_extracted,
+            files_verified = result.files_verified,
+            files_failed = result.files_failed,
+            total_bytes = result.total_bytes_extracted,
+            duration_ms = result.duration_ms,
+            "Carve complete"
+        );
+
         Ok((final_carved, result))
     }
 

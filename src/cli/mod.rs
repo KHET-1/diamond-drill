@@ -51,6 +51,9 @@ pub enum Commands {
     /// Interactive TUI mode (default)
     Interactive(InteractiveArgs),
 
+    /// Carve files from raw disk image by signature scanning
+    Carve(CarveArgs),
+
     /// Find and manage duplicate files
     Dedup(DedupArgs),
 
@@ -218,6 +221,45 @@ pub struct ExportArgs {
     /// Create manifest file with hashes
     #[arg(long, short)]
     pub manifest: bool,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct CarveArgs {
+    /// Source raw disk image (dd, img, iso, or block device)
+    #[arg(required = true)]
+    pub source: PathBuf,
+
+    /// Output directory for carved files
+    #[arg(required = true)]
+    pub output: PathBuf,
+
+    /// Scan aligned to 512-byte sectors (faster for disk images)
+    #[arg(long, default_value = "true")]
+    pub sector_aligned: bool,
+
+    /// Minimum file size to extract (e.g., 1KB, 512)
+    #[arg(long, default_value = "512")]
+    pub min_size: String,
+
+    /// Only carve specific file types
+    #[arg(long, short, value_enum, value_delimiter = ',')]
+    pub file_type: Option<Vec<FileTypeFilter>>,
+
+    /// Number of parallel workers (default: CPU count)
+    #[arg(long, short)]
+    pub workers: Option<usize>,
+
+    /// Dry run - scan and report without extracting
+    #[arg(long, short = 'n')]
+    pub dry_run: bool,
+
+    /// Skip file type verification with infer
+    #[arg(long)]
+    pub no_verify: bool,
+
+    /// Output format (human, json)
+    #[arg(long, value_enum)]
+    pub output_format: Option<OutputFormat>,
 }
 
 #[cfg(feature = "gui")]

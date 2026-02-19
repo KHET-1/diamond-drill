@@ -32,6 +32,7 @@
 //! ```
 
 pub mod badsector;
+pub mod carve;
 pub mod checkpoint;
 pub mod cli;
 pub mod config;
@@ -49,6 +50,7 @@ pub mod tui;
 pub mod gui;
 
 // Re-export commonly used types
+pub use carve::{CarveOptions, CarveProgress, CarveResult, CarvedFile, Carver};
 pub use config::Config;
 pub use core::{DrillEngine, FileEntry, FileIndex, FileType};
 pub use dedup::{analyze, DedupOptions, DedupReport, DupGroup, KeepStrategy};

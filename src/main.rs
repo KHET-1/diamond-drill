@@ -45,6 +45,9 @@ async fn main() -> Result<()> {
             let engine = DrillEngine::load_or_create(&args.source).await?;
             engine.export_selected(&args).await?;
         }
+        Some(Commands::Carve(args)) => {
+            run_carve(args).await?;
+        }
         Some(Commands::Interactive(args)) => {
             cli::interactive::run_interactive_session(&args).await?;
         }
@@ -130,4 +133,179 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_carve(args: cli::CarveArgs) -> Result<()> {
+    use colored::Colorize;
+    use diamond_drill::carve::{CarveOptions, CarveProgress, Carver};
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let min_size = parse_size_str(&args.min_size).unwrap_or(512);
+
+    let file_types = args.file_type.map(|filters| {
+        filters
+            .into_iter()
+            .filter_map(|ft| match ft {
+                cli::FileTypeFilter::Image => Some(diamond_drill::core::FileType::Image),
+                cli::FileTypeFilter::Video => Some(diamond_drill::core::FileType::Video),
+                cli::FileTypeFilter::Audio => Some(diamond_drill::core::FileType::Audio),
+                cli::FileTypeFilter::Document => Some(diamond_drill::core::FileType::Document),
+                cli::FileTypeFilter::Archive => Some(diamond_drill::core::FileType::Archive),
+                cli::FileTypeFilter::Code => Some(diamond_drill::core::FileType::Code),
+                cli::FileTypeFilter::All => None,
+            })
+            .collect()
+    });
+
+    let image_size = std::fs::metadata(&args.source).map(|m| m.len()).unwrap_or(0);
+
+    let opts = CarveOptions {
+        source: args.source.clone(),
+        output_dir: args.output.clone(),
+        sector_aligned: args.sector_aligned,
+        min_size,
+        file_types,
+        workers: args.workers.unwrap_or_else(num_cpus::get),
+        dry_run: args.dry_run,
+        verify: !args.no_verify,
+    };
+
+    let json_output = matches!(args.output_format, Some(cli::OutputFormat::Json));
+
+    if !json_output {
+        println!(
+            "\n{} Carving files from: {}",
+            "💎".bright_cyan(),
+            args.source.display().to_string().bright_white()
+        );
+        println!(
+            "   Output: {}  |  Mode: {}  |  Image: {}",
+            args.output.display().to_string().bright_white(),
+            if args.dry_run { "dry run" } else { "extract" },
+            humansize::format_size(image_size, humansize::BINARY),
+        );
+    }
+
+    let pb = if !json_output {
+        let pb = ProgressBar::new(image_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+                )
+                .unwrap()
+                .progress_chars("█▓▒░"),
+        );
+        pb.set_message("Scanning...");
+        Some(pb)
+    } else {
+        None
+    };
+
+    let carver = Carver::new(opts);
+    let (carved, result) = carver
+        .carve_with_progress(|progress| {
+            match progress {
+                CarveProgress::ScanComplete { headers_found } => {
+                    if let Some(ref pb) = pb {
+                        pb.finish_with_message(format!("Scan done: {} headers", headers_found));
+                    }
+                }
+                CarveProgress::Extracting { current, total, ref extension } => {
+                    if let Some(ref pb) = pb {
+                        if current == 1 {
+                            pb.reset();
+                            pb.set_length(total as u64);
+                            pb.set_style(
+                                ProgressStyle::default_bar()
+                                    .template(
+                                        "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                                    )
+                                    .unwrap()
+                                    .progress_chars("█▓▒░"),
+                            );
+                        }
+                        pb.set_position(current as u64);
+                        pb.set_message(format!("Extracting .{}", extension));
+                    }
+                }
+                CarveProgress::Done => {
+                    if let Some(ref pb) = pb {
+                        pb.finish_and_clear();
+                    }
+                }
+                _ => {}
+            }
+        })
+        .await?;
+
+    if json_output {
+        let output = serde_json::json!({
+            "files_found": result.files_found,
+            "files_extracted": result.files_extracted,
+            "files_verified": result.files_verified,
+            "files_failed": result.files_failed,
+            "total_bytes_extracted": result.total_bytes_extracted,
+            "image_size": result.image_size,
+            "duration_ms": result.duration_ms,
+            "by_type": result.by_type,
+            "files": carved,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    println!("\n{}", "═".repeat(60).bright_cyan());
+    println!(
+        "  {} {} files found, {} extracted",
+        "✓".bright_green().bold(),
+        result.files_found,
+        result.files_extracted,
+    );
+    if result.files_verified > 0 {
+        println!("  {} {} verified by content type", "✓".bright_green(), result.files_verified);
+    }
+    if result.files_failed > 0 {
+        println!("  {} {} failed", "⚠".yellow(), result.files_failed);
+    }
+    println!(
+        "  {} Total extracted: {}",
+        "📊",
+        humansize::format_size(result.total_bytes_extracted, humansize::BINARY)
+    );
+    if result.duration_ms > 0 {
+        let speed = result.image_size * 1000 / result.duration_ms.max(1);
+        println!(
+            "  {} {:.1}s | {}/s",
+            "⏱ ",
+            result.duration_ms as f64 / 1000.0,
+            humansize::format_size(speed, humansize::BINARY),
+        );
+    }
+    if !result.by_type.is_empty() {
+        println!("\n  By type:");
+        let mut types: Vec<_> = result.by_type.iter().collect();
+        types.sort_by(|a, b| b.1.cmp(a.1));
+        for (ext, count) in types {
+            println!("    {} .{}: {}", "•".bright_cyan(), ext, count);
+        }
+    }
+    println!("{}", "═".repeat(60).bright_cyan());
+    Ok(())
+}
+
+fn parse_size_str(s: &str) -> Option<u64> {
+    let s = s.trim().to_uppercase();
+    let (num, unit) = if s.ends_with("GB") {
+        (&s[..s.len() - 2], 1024u64 * 1024 * 1024)
+    } else if s.ends_with("MB") {
+        (&s[..s.len() - 2], 1024u64 * 1024)
+    } else if s.ends_with("KB") {
+        (&s[..s.len() - 2], 1024u64)
+    } else if s.ends_with('B') {
+        (&s[..s.len() - 1], 1u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * unit)
 }
