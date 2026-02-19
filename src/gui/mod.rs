@@ -1,11 +1,12 @@
 //! GUI module - Optional graphical interface using iced
 //!
 //! Provides a modern, responsive GUI for Diamond Drill.
+//! Build with `--features gui` to enable.
 
 #[cfg(feature = "gui")]
 mod app;
 #[cfg(feature = "gui")]
-mod theme;
+pub mod theme;
 
 #[cfg(feature = "gui")]
 pub use app::run_gui;
