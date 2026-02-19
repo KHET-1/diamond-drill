@@ -123,7 +123,9 @@ impl Exporter {
 
         // Ensure destination exists
         if !self.options.dry_run {
-            fs::create_dir_all(&self.options.dest).await?;
+            fs::create_dir_all(&self.options.dest)
+                .await
+                .with_context(|| format!("Failed to create destination: {}", self.options.dest.display()))?;
         }
 
         let total = entries.len();

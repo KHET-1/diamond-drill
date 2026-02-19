@@ -555,25 +555,37 @@ impl Carver {
 /// Scan forward in `data` for `footer` bytes.
 /// Search begins at `min_offset` (the footer can't appear before the file
 /// has reached min_offset bytes, so there's no point scanning earlier).
+/// Scan for `footer` bytes in `data`, starting at `min_offset`.
+/// Uses `memchr` for the first-byte search (SIMD-accelerated, ~10x faster
+/// than byte-by-byte for large scans like JPEG FFD9 in multi-MB files).
 fn find_footer(data: &[u8], footer: &[u8], min_offset: usize) -> Option<usize> {
     let flen = footer.len();
     if flen == 0 || data.len() < flen {
         return None;
     }
 
-    // Start searching at min_offset (file must be at least this big)
-    let search_start = min_offset;
-    // Last valid start position for a footer match
     let search_end = data.len() - flen + 1;
-
-    if search_start >= search_end {
+    if min_offset >= search_end {
         return None;
     }
 
-    for i in search_start..search_end {
-        if data[i] == footer[0] && data[i..i + flen] == *footer {
-            return Some(i);
+    let first_byte = footer[0];
+    let haystack = &data[min_offset..];
+
+    if flen == 1 {
+        return memchr::memchr(first_byte, haystack).map(|i| i + min_offset);
+    }
+
+    let mut offset = 0;
+    while let Some(pos) = memchr::memchr(first_byte, &haystack[offset..]) {
+        let abs = min_offset + offset + pos;
+        if abs >= search_end {
+            break;
         }
+        if data[abs..abs + flen] == *footer {
+            return Some(abs);
+        }
+        offset += pos + 1;
     }
     None
 }

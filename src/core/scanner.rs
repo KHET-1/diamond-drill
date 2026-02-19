@@ -102,11 +102,12 @@ impl Scanner {
                 walker = walker.max_depth(depth);
             }
 
+            let source_path = options.source.clone();
             walker
                 .into_iter()
-                .filter_entry(|e| {
+                .filter_entry(move |e| {
                     if options.skip_hidden {
-                        !is_hidden(e)
+                        e.path() == source_path || !is_hidden(e)
                     } else {
                         true
                     }

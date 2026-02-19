@@ -72,13 +72,10 @@ pdf-extract = "0.10"
 
 # Hashing
 blake3 = "1.5"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # File system & paths
 walkdir = "2.4"
-ignore = "0.4"
 globset = "0.4"
-pathdiff = "0.2"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -96,14 +93,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-humantime = "2.1"
 
 # Memory mapping (for fast disk reads)
 memmap2 = "0.9"
 
+# Fast byte search for footer scanning
+memchr = "2.7"
+
 # File type detection
 infer = "0.15"
-mime_guess = "2.0"
 
 # Human readable sizes
 humansize = "2.1"
@@ -129,7 +127,6 @@ unicode-normalization = "0.1"
 
 # Fuzzy search
 fuzzy-matcher = "0.3"
-nucleo-matcher = "0.3"
 
 # State persistence
 directories = "5.0"

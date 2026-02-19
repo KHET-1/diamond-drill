@@ -3,7 +3,7 @@
 //! Each agent is a specialized worker that can operate independently
 //! while coordinating through message channels.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -222,8 +222,7 @@ impl ScanAgent {
         Ok(())
     }
 
-    fn process_file(&self, path: &PathBuf) -> Result<()> {
-        // Validate file is readable
+    fn process_file(&self, path: &Path) -> Result<()> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("Failed to read metadata: {}", path.display()))?;
 
@@ -233,7 +232,7 @@ impl ScanAgent {
 
         // Send to chunk agent
         self.output
-            .send(SwarmMessage::FilePath(path.clone()))
+            .send(SwarmMessage::FilePath(path.to_path_buf()))
             .with_context(|| "Failed to send to chunk agent")?;
 
         Ok(())
@@ -324,7 +323,7 @@ impl ChunkAgent {
         Ok(())
     }
 
-    fn process_file(&self, path: &PathBuf) -> Result<()> {
+    fn process_file(&self, path: &Path) -> Result<()> {
         let data = std::fs::read(path)
             .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
@@ -352,7 +351,7 @@ impl ChunkAgent {
         for (chunk_id, chunk_data) in chunks {
             self.stats.chunks_created.fetch_add(1, Ordering::Relaxed);
             self.output.send(SwarmMessage::Chunk {
-                source: path.clone(),
+                source: path.to_path_buf(),
                 chunk_id,
                 data: chunk_data,
             })?;

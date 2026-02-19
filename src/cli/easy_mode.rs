@@ -7,7 +7,7 @@
 //! - Connected USB drives
 //! - Network shares
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -68,7 +68,7 @@ impl DetectedSource {
     }
 
     /// Get the actual path to use
-    pub fn path(&self) -> &PathBuf {
+    pub fn path(&self) -> &Path {
         match self {
             DetectedSource::Directory(p) => p,
             DetectedSource::DiskImage(p) => p,
@@ -304,7 +304,7 @@ fn step_select_source() -> Result<PathBuf> {
                 }
             }
 
-            source.path().clone()
+            source.path().to_path_buf()
         }
         0 => {
             // No auto-detected sources, retry

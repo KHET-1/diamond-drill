@@ -112,7 +112,10 @@ impl DrillEngine {
         }
 
         // Wait for scanner to complete
-        let scan_stats = scan_handle.await??;
+        let scan_stats = scan_handle
+            .await
+            .context("Scanner task panicked")?
+            .context("Scanner failed")?;
 
         // Update index
         {
@@ -147,17 +150,27 @@ impl DrillEngine {
         // Save index (now includes bad_sectors)
         // Clone index data before await to avoid holding lock across await point
         if let Some(ref index_path) = args.index_file {
-            let index_data = bincode::serialize(&*self.index.read())?;
+            let index_data = bincode::serialize(&*self.index.read())
+                .context("Failed to serialize index")?;
             let path = index_path.clone();
-            tokio::task::spawn_blocking(move || std::fs::write(&path, index_data)).await??;
+            tokio::task::spawn_blocking(move || std::fs::write(&path, index_data))
+                .await
+                .context("Index save task panicked")?
+                .with_context(|| format!("Failed to write index to {}", index_path.display()))?;
         } else {
             let default_path = Self::get_index_path(&args.source);
             if let Some(parent) = default_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| format!("Failed to create index directory: {}", parent.display()))?;
             }
-            let index_data = bincode::serialize(&*self.index.read())?;
-            let path = default_path;
-            tokio::task::spawn_blocking(move || std::fs::write(&path, index_data)).await??;
+            let index_data = bincode::serialize(&*self.index.read())
+                .context("Failed to serialize index")?;
+            let path = default_path.clone();
+            tokio::task::spawn_blocking(move || std::fs::write(&path, index_data))
+                .await
+                .context("Index save task panicked")?
+                .with_context(|| format!("Failed to write index to {}", default_path.display()))?;
         }
 
         Ok(())
@@ -255,7 +268,9 @@ impl DrillEngine {
     pub async fn search_glob(&self, pattern: &str) -> Result<Vec<String>> {
         use globset::Glob;
 
-        let glob = Glob::new(pattern)?.compile_matcher();
+        let glob = Glob::new(pattern)
+            .with_context(|| format!("Invalid glob pattern: {}", pattern))?
+            .compile_matcher();
 
         Ok(self
             .index
@@ -275,7 +290,8 @@ impl DrillEngine {
 
     /// Regex search
     pub async fn search_regex(&self, pattern: &str) -> Result<Vec<String>> {
-        let regex = regex::Regex::new(pattern)?;
+        let regex = regex::Regex::new(pattern)
+            .with_context(|| format!("Invalid regex pattern: {}", pattern))?;
 
         Ok(self
             .index
