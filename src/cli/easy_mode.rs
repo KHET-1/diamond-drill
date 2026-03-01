@@ -165,8 +165,13 @@ pub async fn run_easy_mode() -> Result<()> {
         // Step 1: Select source
         let source = step_select_source()?;
 
-        // Step 2: Index the source (with scenario-aware config)
-        let engine = step_index_source(&source, scenario).await?;
+        // Check for a saved scan before re-indexing
+        let engine = if let Some(engine) = try_load_saved_scan(&source).await? {
+            engine
+        } else {
+            // Step 2: Index the source (with scenario-aware config)
+            step_index_source(&source, scenario).await?
+        };
 
         // Step 3: Find files
         let selected_files = step_find_files(&engine).await?;
@@ -210,6 +215,23 @@ pub async fn run_easy_mode() -> Result<()> {
             "✓".bright_green().bold(),
             "Recovery complete! Your files are safe.".bright_green()
         );
+
+        // Show verify tip if manifest was created
+        if let Some(ref manifest_path) = export_result.manifest_path {
+            println!(
+                "\n  {} {}",
+                "🔒".bright_cyan(),
+                "To verify your files haven't changed later, run:".bright_white()
+            );
+            println!(
+                "     {}",
+                format!("diamond-drill verify {}", manifest_path.display()).bright_cyan()
+            );
+            println!(
+                "     {}",
+                "This checks every file's hash to make sure nothing is corrupted.".bright_white()
+            );
+        }
 
         // Step 6: Satisfaction check — returns true if user wants to run again
         if !step_satisfaction_check_should_retry().await? {
@@ -449,6 +471,67 @@ fn step_select_source() -> Result<PathBuf> {
     }
 }
 
+/// Check if a saved scan exists for this source and offer to resume
+async fn try_load_saved_scan(source: &std::path::Path) -> Result<Option<DrillEngine>> {
+    let index_path = DrillEngine::get_index_path(source);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    // Try to load the engine from the saved index
+    let engine = DrillEngine::load_or_create(source).await?;
+    let count = engine.file_count().await;
+
+    if count == 0 {
+        return Ok(None);
+    }
+
+    // Get the index file's modification time for display
+    let age = std::fs::metadata(&index_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| {
+            if d.as_secs() < 60 {
+                "just now".to_string()
+            } else if d.as_secs() < 3600 {
+                format!("{} min ago", d.as_secs() / 60)
+            } else if d.as_secs() < 86400 {
+                format!("{} hours ago", d.as_secs() / 3600)
+            } else {
+                format!("{} days ago", d.as_secs() / 86400)
+            }
+        })
+        .unwrap_or_else(|| "unknown".into());
+
+    println!(
+        "\n{} {}",
+        "💾".bright_cyan(),
+        "Found a saved scan from a previous session!".bright_yellow().bold()
+    );
+    println!(
+        "  {} files indexed (saved {})\n",
+        format!("{}", count).bright_white().bold(),
+        age.bright_white()
+    );
+
+    let resume = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Use the saved scan? (No = scan fresh)")
+        .default(true)
+        .interact()?;
+
+    if resume {
+        println!(
+            "\n  {} Loaded {} files from saved scan\n",
+            "✓".bright_green().bold(),
+            count
+        );
+        Ok(Some(engine))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn step_index_source(
     source: &std::path::Path,
     scenario: RecoveryScenario,
@@ -460,15 +543,6 @@ async fn step_index_source(
     println!("  This might take a moment for large drives.\n");
 
     let engine = DrillEngine::new(source.to_path_buf()).await?;
-
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .expect("valid progress bar template"),
-    );
-    pb.set_message("Scanning files...");
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Apply scenario-aware configuration
     let (skip_hidden, extensions, depth) = scenario.scan_config();
@@ -487,13 +561,160 @@ async fn step_index_source(
         block_size: 4096,
     };
 
-    engine.index_with_progress(&args).await?;
+    // Live progress counters
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use crate::core::FileType;
 
-    pb.finish_with_message(format!(
-        "{} Found {} files",
-        "✓".bright_green(),
-        engine.file_count().await
-    ));
+    let type_counts: Arc<Mutex<HashMap<FileType, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let total_size = Arc::new(AtomicU64::new(0));
+    let file_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Spawn a display updater that redraws every 200ms
+    let tc = Arc::clone(&type_counts);
+    let ts = Arc::clone(&total_size);
+    let fc = Arc::clone(&file_count);
+    let display_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dd = Arc::clone(&display_done);
+    let start_time = std::time::Instant::now();
+
+    let display_handle = tokio::spawn(async move {
+        let term = console::Term::stderr();
+        let mut last_lines = 0usize;
+        loop {
+            if dd.load(Ordering::Relaxed) {
+                // Clear the live display
+                for _ in 0..last_lines {
+                    let _ = term.clear_line();
+                    let _ = term.move_cursor_up(1);
+                }
+                let _ = term.clear_line();
+                break;
+            }
+
+            // Clear previous output
+            for _ in 0..last_lines {
+                let _ = term.clear_line();
+                let _ = term.move_cursor_up(1);
+            }
+            let _ = term.clear_line();
+
+            let count = fc.load(Ordering::Relaxed);
+            let size = ts.load(Ordering::Relaxed);
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let counts = tc.lock().unwrap().clone();
+
+            // Build display
+            let mut lines = Vec::new();
+            lines.push(format!(
+                "  {} Scanning... {} files found  ({})  {:.1}s",
+                "\u{25c6}".bright_cyan(),
+                format!("{}", count).bright_white().bold(),
+                humansize::format_size(size, humansize::BINARY).bright_cyan(),
+                elapsed,
+            ));
+
+            // Type breakdown — show non-zero types, sorted by count
+            let mut type_list: Vec<(FileType, usize)> = counts.into_iter().collect();
+            type_list.sort_by(|a, b| b.1.cmp(&a.1));
+            for (ft, c) in type_list.iter().take(6) {
+                let icon = match ft {
+                    FileType::Image => "  📷 Images",
+                    FileType::Video => "  🎬 Videos",
+                    FileType::Audio => "  🎵 Audio ",
+                    FileType::Document => "  📄 Docs  ",
+                    FileType::Archive => "  📦 Archiv",
+                    FileType::Code => "  💻 Code  ",
+                    FileType::Executable => "  ⚡ Exec  ",
+                    FileType::Database => "  🗃  DB    ",
+                    FileType::Other => "  📁 Other ",
+                };
+                // Mini bar
+                let max_bar = 20usize;
+                let bar_len = if count > 0 {
+                    (*c as f64 / count as f64 * max_bar as f64) as usize
+                } else {
+                    0
+                };
+                let bar = format!(
+                    "{}{}",
+                    "\u{2588}".repeat(bar_len),
+                    "\u{2591}".repeat(max_bar.saturating_sub(bar_len))
+                );
+                lines.push(format!(
+                    "{}  {}  {:>5}",
+                    icon,
+                    bar.bright_cyan(),
+                    c
+                ));
+            }
+
+            last_lines = lines.len();
+            for line in &lines {
+                eprintln!("{}", line);
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+
+    // Run indexing with live callback
+    let tc2 = Arc::clone(&type_counts);
+    let ts2 = Arc::clone(&total_size);
+    let fc2 = Arc::clone(&file_count);
+
+    engine
+        .index_with_live_progress(&args, |_count, entry| {
+            fc2.fetch_add(1, Ordering::Relaxed);
+            ts2.fetch_add(entry.size, Ordering::Relaxed);
+            if let Ok(mut map) = tc2.lock() {
+                *map.entry(entry.file_type).or_insert(0) += 1;
+            }
+        })
+        .await?;
+
+    // Stop display
+    display_done.store(true, Ordering::Relaxed);
+    let _ = display_handle.await;
+
+    let total = engine.file_count().await;
+    let total_bytes = total_size.load(Ordering::Relaxed);
+    let elapsed = start_time.elapsed();
+
+    println!(
+        "  {} Found {} files ({}) in {:.1}s",
+        "✓".bright_green().bold(),
+        format!("{}", total).bright_white().bold(),
+        humansize::format_size(total_bytes, humansize::BINARY).bright_cyan(),
+        elapsed.as_secs_f64(),
+    );
+
+    // Show final type summary
+    let counts = type_counts.lock().unwrap().clone();
+    let mut type_list: Vec<(FileType, usize)> = counts.into_iter().collect();
+    type_list.sort_by(|a, b| b.1.cmp(&a.1));
+    for (ft, c) in type_list.iter().take(6) {
+        let label = match ft {
+            FileType::Image => "  📷 Images:",
+            FileType::Video => "  🎬 Videos:",
+            FileType::Audio => "  🎵 Audio: ",
+            FileType::Document => "  📄 Docs:  ",
+            FileType::Archive => "  📦 Archives:",
+            FileType::Code => "  💻 Code:  ",
+            FileType::Executable => "  ⚡ Executables:",
+            FileType::Database => "  🗃  Databases:",
+            FileType::Other => "  📁 Other: ",
+        };
+        println!("    {} {}", label, format!("{}", c).bright_white());
+    }
+
+    println!(
+        "\n  {} {}",
+        "💾".bright_cyan(),
+        "Scan saved! You can close and come back later without rescanning."
+            .bright_white()
+    );
 
     println!();
     Ok(engine)

@@ -77,7 +77,8 @@ impl DrillEngine {
     }
 
     /// Get the default index path for a source
-    fn get_index_path(source: &Path) -> PathBuf {
+    /// Get the default index path for a given source
+    pub fn get_index_path(source: &Path) -> PathBuf {
         let hash = blake3::hash(source.to_string_lossy().as_bytes());
         let hex = hex::encode(&hash.as_bytes()[..8]);
 
@@ -88,6 +89,19 @@ impl DrillEngine {
 
     /// Index with progress reporting
     pub async fn index_with_progress(&self, args: &IndexArgs) -> Result<()> {
+        self.index_with_live_progress(args, |_, _| {}).await
+    }
+
+    /// Index with a live callback fired for each file discovered.
+    /// Callback receives (files_so_far, &FileEntry).
+    pub async fn index_with_live_progress<F>(
+        &self,
+        args: &IndexArgs,
+        mut on_file: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &FileEntry),
+    {
         let options = ScanOptions {
             source: args.source.clone(),
             skip_hidden: args.skip_hidden,
@@ -144,6 +158,9 @@ impl DrillEngine {
             if checkpoint.should_auto_save() {
                 checkpoint_mgr.auto_save(&mut checkpoint)?;
             }
+
+            // Fire live progress callback
+            on_file(entries.len() + 1, &entry);
 
             entries.push(entry);
         }
