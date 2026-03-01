@@ -16,6 +16,7 @@ pub enum Tab {
     Files,
     Search,
     Export,
+    Carve,
     Dedup,
     BadSectors,
 }
@@ -26,6 +27,7 @@ impl Tab {
             Tab::Files,
             Tab::Search,
             Tab::Export,
+            Tab::Carve,
             Tab::Dedup,
             Tab::BadSectors,
         ]
@@ -36,6 +38,7 @@ impl Tab {
             Tab::Files => " Files ",
             Tab::Search => " Search ",
             Tab::Export => " Export ",
+            Tab::Carve => " Carve ",
             Tab::Dedup => " Dedup ",
             Tab::BadSectors => " BadSectors ",
         }
@@ -46,8 +49,9 @@ impl Tab {
             Tab::Files => 0,
             Tab::Search => 1,
             Tab::Export => 2,
-            Tab::Dedup => 3,
-            Tab::BadSectors => 4,
+            Tab::Carve => 3,
+            Tab::Dedup => 4,
+            Tab::BadSectors => 5,
         }
     }
 
@@ -55,7 +59,8 @@ impl Tab {
         match self {
             Tab::Files => Tab::Search,
             Tab::Search => Tab::Export,
-            Tab::Export => Tab::Dedup,
+            Tab::Export => Tab::Carve,
+            Tab::Carve => Tab::Dedup,
             Tab::Dedup => Tab::BadSectors,
             Tab::BadSectors => Tab::Files,
         }
@@ -66,7 +71,8 @@ impl Tab {
             Tab::Files => Tab::BadSectors,
             Tab::Search => Tab::Files,
             Tab::Export => Tab::Search,
-            Tab::Dedup => Tab::Export,
+            Tab::Carve => Tab::Export,
+            Tab::Dedup => Tab::Carve,
             Tab::BadSectors => Tab::Dedup,
         }
     }
@@ -211,8 +217,9 @@ impl App {
             KeyCode::Char('1') => self.tab = Tab::Files,
             KeyCode::Char('2') => self.tab = Tab::Search,
             KeyCode::Char('3') => self.tab = Tab::Export,
-            KeyCode::Char('4') => self.tab = Tab::Dedup,
-            KeyCode::Char('5') => self.tab = Tab::BadSectors,
+            KeyCode::Char('4') => self.tab = Tab::Carve,
+            KeyCode::Char('5') => self.tab = Tab::Dedup,
+            KeyCode::Char('6') => self.tab = Tab::BadSectors,
 
             // Select all / none / invert
             KeyCode::Char('a') => self.select_all(),
@@ -480,6 +487,9 @@ mod tests {
 
         app.tab = app.tab.next();
         assert_eq!(app.tab, Tab::Export);
+
+        app.tab = app.tab.next();
+        assert_eq!(app.tab, Tab::Carve);
 
         app.tab = app.tab.next();
         assert_eq!(app.tab, Tab::Dedup);

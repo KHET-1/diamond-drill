@@ -129,6 +129,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Files => draw_files_tab(frame, area, app),
         Tab::Search => draw_search_tab(frame, area, app),
         Tab::Export => draw_export_tab(frame, area, app),
+        Tab::Carve => draw_carve_tab(frame, area),
         Tab::Dedup => draw_dedup_tab(frame, area, app),
         Tab::BadSectors => draw_badsector_tab(frame, area, app),
     }
@@ -249,7 +250,7 @@ fn draw_search_tab(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Draw export tab
 fn draw_export_tab(frame: &mut Frame, area: Rect, app: &App) {
-    let text = vec![
+    let mut text = vec![
         Line::from(""),
         Line::from(Span::styled(
             "  Export",
@@ -260,11 +261,73 @@ fn draw_export_tab(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(format!("  Selected: {} files", app.selected_files.len())),
         Line::from(""),
-        Line::from("  Use Space to select files in the Files tab,"),
-        Line::from("  then run `diamond-drill export` to export."),
     ];
 
+    if app.selected_files.is_empty() {
+        text.push(Line::from(Span::styled(
+            "  No files selected. Go to Files tab and press Space to select.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        text.push(Line::from(Span::styled(
+            "  Export is not yet available in the TUI.",
+            Style::default().fg(Color::Yellow),
+        )));
+        text.push(Line::from(""));
+        text.push(Line::from("  To export your selected files, use the CLI:"));
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            "    diamond-drill export <source> <destination>",
+            Style::default().fg(Color::Cyan),
+        )));
+        text.push(Line::from(""));
+        text.push(Line::from("  Or use Interactive mode for a guided export:"));
+        text.push(Line::from(Span::styled(
+            "    diamond-drill interactive <source>",
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
     let block = Block::default().borders(Borders::ALL).title(" Export ");
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Draw carve tab — honest about current status
+fn draw_carve_tab(frame: &mut Frame, area: Rect) {
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  File Carving",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Carving is not yet available in the TUI.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from("  Carve recovers files from raw disk images by scanning for"),
+        Line::from("  file signatures (JPEG, PNG, PDF, MP4, ZIP, and 60+ formats)."),
+        Line::from(""),
+        Line::from("  To carve files, use the CLI:"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "    diamond-drill carve <disk-image> <output-dir>",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from("  Or use Interactive mode for a guided workflow:"),
+        Line::from(Span::styled(
+            "    diamond-drill interactive",
+            Style::default().fg(Color::Cyan),
+        )),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title(" Carve ");
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
@@ -367,7 +430,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::Yellow),
         )),
         Line::from("    Tab/Shift+Tab Switch tabs"),
-        Line::from("    1-5          Jump to tab"),
+        Line::from("    1-6          Jump to tab"),
         Line::from("    /            Enter search mode"),
         Line::from(""),
         Line::from(Span::styled(

@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use super::index::{FileEntry, FileIndex, IndexStats};
 use super::scanner::{ScanOptions, Scanner};
 use super::{FileType, Progress};
+use crate::checkpoint::{Checkpoint, CheckpointManager, CheckpointPhase};
 use crate::cli::IndexArgs;
 use crate::export::{ExportOptions, ExportResult, Exporter};
 use crate::preview::ThumbnailGenerator;
@@ -96,6 +97,31 @@ impl DrillEngine {
             same_file_system: false,
         };
 
+        // Load checkpoint if resuming
+        let checkpoint_mgr = CheckpointManager::new();
+        let mut checkpoint = if args.resume {
+            match checkpoint_mgr.load(&args.source, CheckpointPhase::Indexing)? {
+                Some(cp) => {
+                    tracing::info!(
+                        "Resuming from checkpoint: {} files already indexed",
+                        cp.processed_count()
+                    );
+                    cp
+                }
+                None => Checkpoint::new(
+                    &args.source,
+                    CheckpointPhase::Indexing,
+                    args.checkpoint_interval,
+                ),
+            }
+        } else {
+            Checkpoint::new(
+                &args.source,
+                CheckpointPhase::Indexing,
+                args.checkpoint_interval,
+            )
+        };
+
         let scanner = Scanner::new(options);
         let (tx, mut rx) = mpsc::channel::<FileEntry>(1000);
 
@@ -105,9 +131,20 @@ impl DrillEngine {
             tokio::spawn(async move { scanner.scan_parallel(tx, bad_sectors).await })
         };
 
-        // Collect results
+        // Collect results, skipping already-processed entries on resume
         let mut entries = Vec::new();
         while let Some(entry) = rx.recv().await {
+            let path_str = entry.path.to_string_lossy().to_string();
+            if checkpoint.is_already_processed(&path_str) {
+                continue;
+            }
+            checkpoint.mark_processed(&path_str, None);
+
+            // Auto-save checkpoint periodically
+            if checkpoint.should_auto_save() {
+                checkpoint_mgr.auto_save(&mut checkpoint)?;
+            }
+
             entries.push(entry);
         }
 
@@ -173,12 +210,30 @@ impl DrillEngine {
                 .with_context(|| format!("Failed to write index to {}", default_path.display()))?;
         }
 
+        // Clear checkpoint on success
+        checkpoint_mgr.clear(&args.source, CheckpointPhase::Indexing)?;
+
         Ok(())
     }
 
     /// Get total file count
     pub async fn file_count(&self) -> usize {
         self.index.read().len()
+    }
+
+    /// Get all file entries (for dedup/badsector analysis)
+    pub async fn get_all_entries(&self) -> Vec<FileEntry> {
+        self.index.read().entries().cloned().collect()
+    }
+
+    /// Get bad sector count
+    pub async fn bad_sector_count(&self) -> usize {
+        self.bad_sectors.read().len()
+    }
+
+    /// Get all bad sectors
+    pub async fn get_bad_sectors(&self) -> Vec<super::BadSector> {
+        self.bad_sectors.read().clone()
     }
 
     /// Get all files as path strings
@@ -253,8 +308,83 @@ impl DrillEngine {
             crate::cli::SearchType::Exact => self.search_exact(&args.pattern).await?,
         };
 
-        // Apply filters
-        let filtered: Vec<_> = results.into_iter().take(args.limit).collect();
+        // Parse size filters
+        let min_size = args.min_size.as_ref().and_then(|s| parse_size_str(s));
+        let max_size = args.max_size.as_ref().and_then(|s| parse_size_str(s));
+
+        // Parse date filters
+        let after_date = args.after.as_ref().and_then(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+        });
+        let before_date = args.before.as_ref().and_then(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(23, 59, 59))
+                .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+        });
+
+        // Map CLI file type filter to core FileType
+        let type_filter = args.file_type.map(|ft| match ft {
+            crate::cli::FileTypeFilter::Image => FileType::Image,
+            crate::cli::FileTypeFilter::Video => FileType::Video,
+            crate::cli::FileTypeFilter::Audio => FileType::Audio,
+            crate::cli::FileTypeFilter::Document => FileType::Document,
+            crate::cli::FileTypeFilter::Archive => FileType::Archive,
+            crate::cli::FileTypeFilter::Code => FileType::Code,
+            crate::cli::FileTypeFilter::All => FileType::Other, // sentinel — won't filter
+        });
+        let filter_all = matches!(args.file_type, Some(crate::cli::FileTypeFilter::All) | None);
+
+        // Apply filters against index entries
+        let index = self.index.read();
+        let filtered: Vec<_> = results
+            .into_iter()
+            .filter(|path| {
+                if let Some(entry) = index.get_by_path(path) {
+                    // File type filter
+                    if !filter_all {
+                        if let Some(ref ft) = type_filter {
+                            if entry.file_type != *ft {
+                                return false;
+                            }
+                        }
+                    }
+                    // Size filters
+                    if let Some(min) = min_size {
+                        if entry.size < min {
+                            return false;
+                        }
+                    }
+                    if let Some(max) = max_size {
+                        if entry.size > max {
+                            return false;
+                        }
+                    }
+                    // Date filters
+                    if let Some(ref after) = after_date {
+                        if let Some(ref modified) = entry.modified {
+                            if modified < after {
+                                return false;
+                            }
+                        }
+                    }
+                    if let Some(ref before) = before_date {
+                        if let Some(ref modified) = entry.modified {
+                            if modified > before {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                } else {
+                    true // path not in index, include anyway
+                }
+            })
+            .take(args.limit)
+            .collect();
 
         for path in &filtered {
             println!("{}", path);
@@ -325,8 +455,12 @@ impl DrillEngine {
             .collect())
     }
 
-    /// Preview files
+    /// Preview files — prints metadata and optionally generates thumbnails
     pub async fn preview_files(&self, args: &crate::cli::PreviewArgs) -> Result<()> {
+        // If --output is set, generate thumbnails to that directory
+        let output_dir = args.output.as_ref();
+        let thumb_size = args.thumb_size;
+
         for file in &args.files {
             if let Some(entry) = self.index.read().get_by_path(file) {
                 println!(
@@ -339,6 +473,38 @@ impl DrillEngine {
                         .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "Unknown".to_string())
                 );
+
+                // Generate thumbnail if output dir specified and file is an image
+                if let Some(out_dir) = output_dir {
+                    if entry.file_type == FileType::Image {
+                        match self.thumbnail_gen.generate(&entry.path, thumb_size) {
+                            Ok(thumb_path) => {
+                                // Copy thumbnail to output dir
+                                let dest_name = format!(
+                                    "thumb_{}_{}.jpg",
+                                    thumb_size,
+                                    entry.path.file_stem()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "unknown".to_string())
+                                );
+                                let dest = out_dir.join(&dest_name);
+                                std::fs::create_dir_all(out_dir).ok();
+                                if let Err(e) = std::fs::copy(&thumb_path, &dest) {
+                                    tracing::warn!("Failed to copy thumbnail: {}", e);
+                                } else {
+                                    println!("    -> thumbnail: {}", dest.display());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to generate thumbnail for {}: {}",
+                                    entry.path.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -388,9 +554,36 @@ impl DrillEngine {
             args.files.clone()
         };
 
+        // Load checkpoint for resume capability
+        let checkpoint_mgr = CheckpointManager::new();
+        let checkpoint = checkpoint_mgr.load(&args.source, CheckpointPhase::Exporting)?;
+
+        // Filter out already-exported files
+        let files_to_export: Vec<String> = if let Some(ref cp) = checkpoint {
+            let skipped = files
+                .iter()
+                .filter(|f| cp.is_already_processed(f))
+                .count();
+            if skipped > 0 {
+                tracing::info!(
+                    "Resuming export: skipping {} already-exported files",
+                    skipped
+                );
+            }
+            files
+                .into_iter()
+                .filter(|f| !cp.is_already_processed(f))
+                .collect()
+        } else {
+            files
+        };
+
         let result = self
-            .export_files_with_progress(&files, &options, |_| {})
+            .export_files_with_progress(&files_to_export, &options, |_| {})
             .await?;
+
+        // Clear checkpoint on success
+        checkpoint_mgr.clear(&args.source, CheckpointPhase::Exporting)?;
 
         println!("\nExport complete:");
         println!("  Successful: {}", result.successful);
@@ -532,4 +725,21 @@ impl DrillEngine {
 
         Ok(())
     }
+}
+
+/// Parse human-readable size string (e.g. "1KB", "10MB", "5GB") to bytes
+fn parse_size_str(s: &str) -> Option<u64> {
+    let s = s.trim().to_uppercase();
+    let (num, unit) = if s.ends_with("GB") {
+        (&s[..s.len() - 2], 1024u64 * 1024 * 1024)
+    } else if s.ends_with("MB") {
+        (&s[..s.len() - 2], 1024u64 * 1024)
+    } else if s.ends_with("KB") {
+        (&s[..s.len() - 2], 1024u64)
+    } else if s.ends_with('B') {
+        (&s[..s.len() - 1], 1u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * unit)
 }

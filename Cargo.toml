@@ -67,7 +67,6 @@ image = { version = "0.24", features = [
   "ico",
   "tiff",
 ] }
-turbojpeg = { version = "1.0", optional = true }
 pdf-extract = "0.10"
 
 # Hashing
@@ -138,6 +137,9 @@ opener = "0.7"
 
 # EXIF reading for thumbnail orientation
 kamadak-exif = "0.5"
+
+# PDF generation for reports
+lopdf = "0.34"
 
 # GPU Embedding (optional, requires CUDA toolkit)
 candle-core = { version = "0.8", optional = true }

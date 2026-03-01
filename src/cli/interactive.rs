@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use colored::Colorize;
 use console::Term;
-use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input};
+use dialoguer::{theme::ColorfulTheme, theme::SimpleTheme, theme::Theme, Confirm, FuzzySelect, Input};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::carve::{CarveOptions, Carver};
@@ -57,11 +57,6 @@ pub async fn run_interactive_session(args: &InteractiveArgs) -> Result<()> {
         }
     }
 
-    // Save session state if requested
-    if session.save_state {
-        session.persist_state().await?;
-    }
-
     println!("\n{}\n", "Thanks for using Diamond Drill! 💎".bright_cyan());
     Ok(())
 }
@@ -90,13 +85,12 @@ enum SessionState {
 }
 
 struct InteractiveSession {
-    _args: InteractiveArgs,
     state: SessionState,
     engine: Option<DrillEngine>,
     selected_files: Vec<String>,
     filter_pattern: String,
     current_directory: PathBuf,
-    save_state: bool,
+    use_simple_theme: bool,
 }
 
 impl InteractiveSession {
@@ -107,15 +101,25 @@ impl InteractiveSession {
             SessionState::SelectSource
         };
 
+        let use_simple_theme = args.theme.to_lowercase() == "light";
+
         Ok(Self {
-            _args: args.clone(),
             state: initial_state,
             engine: None,
             selected_files: Vec::new(),
             filter_pattern: String::new(),
             current_directory: args.source.clone().unwrap_or_else(|| PathBuf::from(".")),
-            save_state: false,
+            use_simple_theme,
         })
+    }
+
+    /// Get the dialoguer theme based on --theme flag
+    fn theme(&self) -> Box<dyn Theme> {
+        if self.use_simple_theme {
+            Box::new(SimpleTheme)
+        } else {
+            Box::new(ColorfulTheme::default())
+        }
     }
 
     async fn select_source(&mut self) -> Result<()> {
@@ -124,7 +128,7 @@ impl InteractiveSession {
             "Select a source to recover files from:".bright_yellow()
         );
 
-        let source: String = Input::with_theme(&ColorfulTheme::default())
+        let source: String = Input::with_theme(&*self.theme())
             .with_prompt("Source path")
             .interact_text()?;
 
@@ -152,7 +156,7 @@ impl InteractiveSession {
         pb.set_style(
             ProgressStyle::default_spinner()
                 .template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                .unwrap(),
+                .expect("valid progress bar template"),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
         pb.set_message("Scanning...");
@@ -219,10 +223,14 @@ impl InteractiveSession {
             }
         );
 
-        // Build display items with type indicators
+        // Paginate file list
+        let page_size = 50;
+        let page_start = 0; // always show first page; pagination via actions below
+
         let display_items: Vec<String> = files
             .iter()
-            .take(50)
+            .skip(page_start)
+            .take(page_size)
             .map(|f| {
                 let icon = get_file_icon(f);
                 let selected = if self.selected_files.contains(f) {
@@ -234,36 +242,49 @@ impl InteractiveSession {
             })
             .collect();
 
-        let options = [
-            "──────────────────────────",
-            "🔍 Search / Filter",
-            "📋 Select All",
-            "📋 Select None",
-            "📤 Export Selected",
-            "👁  Preview Selected",
-            "💎 Carve Raw Image",
-            "🚪 Exit",
-            "──────────────────────────",
+        let mut menu_options = vec![
+            "──────────────────────────".to_string(),
+            "🔍 Search / Filter".to_string(),
+            "📋 Select All".to_string(),
+            "📋 Select None".to_string(),
+            "📤 Export Selected".to_string(),
+            "👁  Preview Selected".to_string(),
+            "💎 Carve Raw Image".to_string(),
+            "🚪 Exit".to_string(),
+            "──────────────────────────".to_string(),
         ];
 
-        let all_items: Vec<&str> = options
+        if files.len() > page_size {
+            menu_options.push(format!(
+                "📄 Showing {}/{} files (use Search to find specific files)",
+                display_items.len(),
+                files.len()
+            ));
+        }
+
+        let all_items: Vec<String> = menu_options
             .iter()
-            .copied()
-            .chain(display_items.iter().map(|s| s.as_str()))
+            .cloned()
+            .chain(display_items.iter().cloned())
             .collect();
 
-        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        let all_refs: Vec<&str> = all_items.iter().map(|s| s.as_str()).collect();
+
+        let menu_len = menu_options.len();
+
+        let selection = FuzzySelect::with_theme(&*self.theme())
             .with_prompt(format!(
-                "Selected: {} | Filter: {}",
+                "Selected: {} | Filter: {} | Total: {}",
                 self.selected_files.len(),
                 if self.filter_pattern.is_empty() {
                     "<none>"
                 } else {
                     &self.filter_pattern
-                }
+                },
+                files.len()
             ))
-            .items(&all_items)
-            .default(8) // First file
+            .items(&all_refs)
+            .default(menu_len) // First file
             .interact_opt()?;
 
         match selection {
@@ -283,8 +304,8 @@ impl InteractiveSession {
                 self.state = SessionState::Exit;
                 return Ok(false);
             }
-            Some(idx) if idx >= 9 => {
-                let file_idx = idx - 9;
+            Some(idx) if idx >= menu_len => {
+                let file_idx = idx - menu_len;
                 if file_idx < files.len() {
                     let file = &files[file_idx];
                     if self.selected_files.contains(file) {
@@ -304,7 +325,7 @@ impl InteractiveSession {
         println!("\n{}", "Search/Filter Files".bright_yellow().bold());
         println!("  Supports: glob (*.jpg), fuzzy (photo), extensions (.rs)\n");
 
-        let pattern: String = Input::with_theme(&ColorfulTheme::default())
+        let pattern: String = Input::with_theme(&*self.theme())
             .with_prompt("Pattern")
             .allow_empty(true)
             .with_initial_text(&self.filter_pattern)
@@ -375,18 +396,18 @@ impl InteractiveSession {
             self.selected_files.len()
         );
 
-        let dest: String = Input::with_theme(&ColorfulTheme::default())
+        let dest: String = Input::with_theme(&*self.theme())
             .with_prompt("Destination folder")
             .interact_text()?;
 
         let dest_path = PathBuf::from(&dest);
 
-        let verify = Confirm::with_theme(&ColorfulTheme::default())
+        let verify = Confirm::with_theme(&*self.theme())
             .with_prompt("Verify file integrity with blake3 hash?")
             .default(true)
             .interact()?;
 
-        let preserve = Confirm::with_theme(&ColorfulTheme::default())
+        let preserve = Confirm::with_theme(&*self.theme())
             .with_prompt("Preserve directory structure?")
             .default(true)
             .interact()?;
@@ -404,7 +425,7 @@ impl InteractiveSession {
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-                .unwrap(),
+                .expect("valid progress bar template"),
         );
 
         let result = engine
@@ -446,7 +467,7 @@ impl InteractiveSession {
         );
         println!("  Scan a raw disk image (dd, img, iso) for file signatures.\n");
 
-        let source: String = Input::with_theme(&ColorfulTheme::default())
+        let source: String = Input::with_theme(&*self.theme())
             .with_prompt("Path to disk image")
             .interact_text()?;
 
@@ -457,12 +478,12 @@ impl InteractiveSession {
             return Ok(());
         }
 
-        let output: String = Input::with_theme(&ColorfulTheme::default())
+        let output: String = Input::with_theme(&*self.theme())
             .with_prompt("Output folder for carved files")
             .with_initial_text("./carved")
             .interact_text()?;
 
-        let dry_run = Confirm::with_theme(&ColorfulTheme::default())
+        let dry_run = Confirm::with_theme(&*self.theme())
             .with_prompt("Dry run first? (scan only, don't extract)")
             .default(true)
             .interact()?;
@@ -567,7 +588,7 @@ impl InteractiveSession {
         println!("{}", "═".repeat(50).bright_cyan());
 
         if dry_run && !carved.is_empty() {
-            if Confirm::with_theme(&ColorfulTheme::default())
+            if Confirm::with_theme(&*self.theme())
                 .with_prompt("Extract these files for real?")
                 .default(true)
                 .interact()?
@@ -597,9 +618,6 @@ impl InteractiveSession {
         Ok(())
     }
 
-    async fn persist_state(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Get emoji icon for file type

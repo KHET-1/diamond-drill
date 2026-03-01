@@ -42,6 +42,7 @@ pub mod export;
 pub mod preview;
 pub mod proof;
 pub mod readonly;
+pub mod report;
 pub mod spinner;
 pub mod swarm;
 pub mod tui;

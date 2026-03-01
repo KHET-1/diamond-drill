@@ -178,7 +178,30 @@ pub async fn run_easy_mode() -> Result<()> {
     let dest = step_select_destination()?;
 
     // Step 5: Export
-    step_export_files(&engine, &selected_files, &dest).await?;
+    let export_result = step_export_files(&engine, &selected_files, &dest).await?;
+
+    // Auto-generate HTML report if export succeeded and manifest was created
+    if let Some(ref manifest_path) = export_result.manifest_path {
+        let report_path = dest.join("diamond-drill-report.html");
+        match crate::report::report_data_from_manifest(manifest_path) {
+            Ok(report_data) => {
+                // Don't use save_html_report (which opens browser) — just write file
+                let html = crate::report::generate_html_report(&report_data);
+                if let Err(e) = std::fs::write(&report_path, html.as_bytes()) {
+                    tracing::warn!("Could not write recovery report: {}", e);
+                } else {
+                    println!(
+                        "  {} Recovery report: {}",
+                        "📊".bright_cyan(),
+                        report_path.display().to_string().bright_white()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not generate report: {}", e);
+            }
+        }
+    }
 
     println!(
         "\n{} {}",
@@ -238,173 +261,189 @@ fn print_banner() {
 }
 
 fn step_select_source() -> Result<PathBuf> {
-    println!("{} Where are your files?", "Step 1:".bright_yellow().bold());
-    println!("  This could be:");
-    println!("  • A backup drive (like E:\\)");
-    println!("  • A folder on your computer");
-    println!("  • A disk image file (.img, .iso)\n");
+    loop {
+        println!("{} Where are your files?", "Step 1:".bright_yellow().bold());
+        println!("  This could be:");
+        println!("  • A backup drive (like E:\\)");
+        println!("  • A folder on your computer");
+        println!("  • A disk image file (.img, .iso)\n");
 
-    // Auto-detect available sources
-    let detected = auto_detect_sources();
-    if !detected.is_empty() {
-        print_detected_sources(&detected);
-    }
+        // Auto-detect available sources
+        let detected = auto_detect_sources();
+        if !detected.is_empty() {
+            print_detected_sources(&detected);
+        }
 
-    let mut options = vec![
-        "🔍 Auto-detected source (see above)".to_string(),
-        "📁 Browse for a folder...".to_string(),
-        "⌨️  Type a path manually".to_string(),
-        "💾 Use a connected drive".to_string(),
-        "💿 Open a disk image file".to_string(),
-    ];
+        let mut options = vec![
+            "🔍 Auto-detected source (see above)".to_string(),
+            "📁 Browse for a folder...".to_string(),
+            "⌨️  Type a path manually".to_string(),
+            "💾 Use a connected drive".to_string(),
+            "💿 Open a disk image file".to_string(),
+        ];
 
-    // Disable auto-detect option if nothing was found
-    if detected.is_empty() {
-        options[0] = "🔍 (No sources auto-detected)".to_string();
-    }
+        // Disable auto-detect option if nothing was found
+        if detected.is_empty() {
+            options[0] = "🔍 (No sources auto-detected)".to_string();
+        }
 
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("How would you like to select the source?")
-        .items(&options)
-        .default(if detected.is_empty() { 1 } else { 0 })
-        .interact()?;
+        let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("How would you like to select the source?")
+            .items(&options)
+            .default(if detected.is_empty() { 1 } else { 0 })
+            .interact()?;
 
-    let path: PathBuf = match selection {
-        0 if !detected.is_empty() => {
-            // Select from auto-detected sources
-            let labels: Vec<String> = detected.iter().map(|s| s.label()).collect();
-            let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select a detected source")
-                .items(&labels)
-                .interact()?;
+        let path: Option<PathBuf> = match selection {
+            0 if !detected.is_empty() => {
+                // Select from auto-detected sources
+                let labels: Vec<String> = detected.iter().map(|s| s.label()).collect();
+                let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select a detected source")
+                    .items(&labels)
+                    .interact()?;
 
-            let source = &detected[idx];
+                let source = &detected[idx];
 
-            // Warn if disk image needs mounting
-            if source.needs_mount() {
+                // Warn if disk image needs mounting
+                if source.needs_mount() {
+                    println!(
+                        "\n{} {}",
+                        "⚠".yellow(),
+                        "Disk image detected! For best results, mount it first:".yellow()
+                    );
+                    #[cfg(target_os = "linux")]
+                    println!(
+                        "    sudo losetup -r /dev/loop0 {}",
+                        source.path().display()
+                    );
+                    #[cfg(target_os = "linux")]
+                    println!("    sudo mount -o ro /dev/loop0 /mnt/image");
+                    #[cfg(target_os = "windows")]
+                    println!("    Right-click the file > Mount (or use disk management)");
+                    println!();
+
+                    if !Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt(
+                            "Continue with unmounted image? (slower, limited features)",
+                        )
+                        .default(true)
+                        .interact()?
+                    {
+                        continue; // retry source selection
+                    }
+                }
+
+                Some(source.path().to_path_buf())
+            }
+            0 => {
+                // No auto-detected sources, retry
+                println!(
+                    "{}",
+                    "No sources detected. Please select another option.".yellow()
+                );
+                continue;
+            }
+            1 => {
+                // Browse for folder
+                Some(
+                    Input::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Enter the folder path")
+                        .validate_with(|input: &String| {
+                            let p = PathBuf::from(input);
+                            if p.exists() {
+                                Ok(())
+                            } else {
+                                Err("Path does not exist")
+                            }
+                        })
+                        .interact_text()?
+                        .into(),
+                )
+            }
+            2 => {
+                // Type path manually
+                Some(
+                    Input::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Enter the full path")
+                        .validate_with(|input: &String| {
+                            let p = PathBuf::from(input);
+                            if p.exists() {
+                                Ok(())
+                            } else {
+                                Err("Path does not exist")
+                            }
+                        })
+                        .interact_text()?
+                        .into(),
+                )
+            }
+            3 => {
+                // List available drives
+                let drives = list_available_drives();
+                if drives.is_empty() {
+                    println!("{}", "No additional drives found.".yellow());
+                    continue;
+                }
+                let drive_idx = FuzzySelect::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select a drive")
+                    .items(&drives)
+                    .interact()?;
+                Some(PathBuf::from(&drives[drive_idx]))
+            }
+            4 => {
+                // Open disk image file
+                let path_str: String = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Enter path to disk image (.img, .iso, .dmg)")
+                    .validate_with(|input: &String| {
+                        let p = PathBuf::from(input);
+                        if !p.exists() {
+                            return Err("File does not exist");
+                        }
+                        if !is_disk_image(&p) {
+                            return Err("Not a recognized disk image format");
+                        }
+                        Ok(())
+                    })
+                    .interact_text()?;
+
+                let p = PathBuf::from(&path_str);
+
+                // Show disk image info
+                if let Some(info) = get_disk_image_info(&p) {
+                    println!("\n  {} {}", "💿".bright_cyan(), info);
+                }
+
                 println!(
                     "\n{} {}",
-                    "⚠".yellow(),
-                    "Disk image detected! For best results, mount it first:".yellow()
+                    "💡".bright_yellow(),
+                    "Tip: Mount the image for faster scanning:".bright_yellow()
                 );
                 #[cfg(target_os = "linux")]
-                println!("    sudo losetup -r /dev/loop0 {}", source.path().display());
-                #[cfg(target_os = "linux")]
-                println!("    sudo mount -o ro /dev/loop0 /mnt/image");
+                {
+                    println!("    sudo losetup -r /dev/loop0 {}", p.display());
+                    println!("    sudo mount -o ro /dev/loop0 /mnt/image");
+                }
                 #[cfg(target_os = "windows")]
-                println!("    Right-click the file > Mount (or use disk management)");
+                println!("    Right-click > Mount, or use Disk Management");
                 println!();
 
-                if !Confirm::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Continue with unmounted image? (slower, limited features)")
-                    .default(true)
-                    .interact()?
-                {
-                    return step_select_source();
-                }
+                Some(p)
             }
+            _ => {
+                // Shouldn't happen, but loop around
+                continue;
+            }
+        };
 
-            source.path().to_path_buf()
-        }
-        0 => {
-            // No auto-detected sources, retry
+        if let Some(path) = path {
             println!(
-                "{}",
-                "No sources detected. Please select another option.".yellow()
+                "\n{} Selected: {}\n",
+                "✓".bright_green(),
+                path.display().to_string().bright_white()
             );
-            return step_select_source();
+            return Ok(path);
         }
-        1 => {
-            // Browse for folder
-            Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Enter the folder path")
-                .validate_with(|input: &String| {
-                    let p = PathBuf::from(input);
-                    if p.exists() {
-                        Ok(())
-                    } else {
-                        Err("Path does not exist")
-                    }
-                })
-                .interact_text()?
-                .into()
-        }
-        2 => {
-            // Type path manually
-            Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Enter the full path")
-                .validate_with(|input: &String| {
-                    let p = PathBuf::from(input);
-                    if p.exists() {
-                        Ok(())
-                    } else {
-                        Err("Path does not exist")
-                    }
-                })
-                .interact_text()?
-                .into()
-        }
-        3 => {
-            // List available drives
-            let drives = list_available_drives();
-            if drives.is_empty() {
-                println!("{}", "No additional drives found.".yellow());
-                return step_select_source();
-            }
-            let drive_idx = FuzzySelect::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select a drive")
-                .items(&drives)
-                .interact()?;
-            PathBuf::from(&drives[drive_idx])
-        }
-        4 => {
-            // Open disk image file
-            let path_str: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Enter path to disk image (.img, .iso, .dmg)")
-                .validate_with(|input: &String| {
-                    let p = PathBuf::from(input);
-                    if !p.exists() {
-                        return Err("File does not exist");
-                    }
-                    if !is_disk_image(&p) {
-                        return Err("Not a recognized disk image format");
-                    }
-                    Ok(())
-                })
-                .interact_text()?;
-
-            let path = PathBuf::from(&path_str);
-
-            // Show disk image info
-            if let Some(info) = get_disk_image_info(&path) {
-                println!("\n  {} {}", "💿".bright_cyan(), info);
-            }
-
-            println!(
-                "\n{} {}",
-                "💡".bright_yellow(),
-                "Tip: Mount the image for faster scanning:".bright_yellow()
-            );
-            #[cfg(target_os = "linux")]
-            {
-                println!("    sudo losetup -r /dev/loop0 {}", path.display());
-                println!("    sudo mount -o ro /dev/loop0 /mnt/image");
-            }
-            #[cfg(target_os = "windows")]
-            println!("    Right-click > Mount, or use Disk Management");
-            println!();
-
-            path
-        }
-        _ => unreachable!(),
-    };
-
-    println!(
-        "\n{} Selected: {}\n",
-        "✓".bright_green(),
-        path.display().to_string().bright_white()
-    );
-    Ok(path)
+    }
 }
 
 async fn step_index_source(
@@ -423,7 +462,7 @@ async fn step_index_source(
     pb.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.cyan} {msg}")
-            .unwrap(),
+            .expect("valid progress bar template"),
     );
     pb.set_message("Scanning files...");
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -458,122 +497,125 @@ async fn step_index_source(
 }
 
 async fn step_find_files(engine: &DrillEngine) -> Result<Vec<String>> {
-    println!(
-        "{} What files do you want to recover?",
-        "Step 3:".bright_yellow().bold()
-    );
+    loop {
+        println!(
+            "{} What files do you want to recover?",
+            "Step 3:".bright_yellow().bold()
+        );
 
-    let options = [
-        "📁 Everything (scan all files)",
-        "📷 Photos & Images",
-        "🎬 Videos",
-        "🎵 Music & Audio",
-        "📄 Documents (PDF, Word, etc.)",
-        "🔍 Search by name...",
-    ];
+        let options = [
+            "📁 Everything (scan all files)",
+            "📷 Photos & Images",
+            "🎬 Videos",
+            "🎵 Music & Audio",
+            "📄 Documents (PDF, Word, etc.)",
+            "🔍 Search by name...",
+        ];
 
-    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select file types (Space to toggle, Enter to confirm)")
-        .items(&options)
-        .interact()?;
+        let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select file types (Space to toggle, Enter to confirm)")
+            .items(&options)
+            .interact()?;
 
-    if selections.is_empty() {
-        println!("{}", "No selection made.".yellow());
-        return Ok(vec![]);
-    }
-
-    let mut files = Vec::new();
-
-    for selection in selections {
-        match selection {
-            0 => files.extend(engine.get_all_files().await?),
-            1 => files.extend(engine.get_files_by_type("image").await?),
-            2 => files.extend(engine.get_files_by_type("video").await?),
-            3 => files.extend(engine.get_files_by_type("audio").await?),
-            4 => files.extend(engine.get_files_by_type("document").await?),
-            5 => {
-                let pattern: String = Input::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Enter search term")
-                    .interact_text()?;
-                files.extend(engine.search_fuzzy(&pattern).await?);
-            }
-            _ => {}
+        if selections.is_empty() {
+            println!("{}", "No selection made.".yellow());
+            return Ok(vec![]);
         }
-    }
 
-    // Deduplicate
-    files.sort();
-    files.dedup();
+        let mut files = Vec::new();
 
-    println!(
-        "\n{} Found {} files matching your criteria",
-        "✓".bright_green(),
-        files.len()
-    );
+        for selection in selections {
+            match selection {
+                0 => files.extend(engine.get_all_files().await?),
+                1 => files.extend(engine.get_files_by_type("image").await?),
+                2 => files.extend(engine.get_files_by_type("video").await?),
+                3 => files.extend(engine.get_files_by_type("audio").await?),
+                4 => files.extend(engine.get_files_by_type("document").await?),
+                5 => {
+                    let pattern: String = Input::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Enter search term")
+                        .interact_text()?;
+                    files.extend(engine.search_fuzzy(&pattern).await?);
+                }
+                _ => {}
+            }
+        }
 
-    // Preview count by type
-    let summary = engine.summarize_files(&files).await?;
-    for (file_type, count) in summary {
-        println!("  {} {} {}", "•".bright_cyan(), count, file_type);
-    }
+        // Deduplicate
+        files.sort();
+        files.dedup();
 
-    // Confirm selection
-    if !Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt("Proceed with these files?")
-        .default(true)
-        .interact()?
-    {
-        return Box::pin(step_find_files(engine)).await;
-    }
+        println!(
+            "\n{} Found {} files matching your criteria",
+            "✓".bright_green(),
+            files.len()
+        );
 
-    Ok(files)
-}
+        // Preview count by type
+        let summary = engine.summarize_files(&files).await?;
+        for (file_type, count) in summary {
+            println!("  {} {} {}", "•".bright_cyan(), count, file_type);
+        }
 
-fn step_select_destination() -> Result<PathBuf> {
-    println!(
-        "\n{} Where should I save the recovered files?",
-        "Step 4:".bright_yellow().bold()
-    );
-
-    let dest: PathBuf = Input::<String>::with_theme(&ColorfulTheme::default())
-        .with_prompt("Enter destination folder")
-        .with_initial_text(
-            dirs::document_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Recovered Files")
-                .to_string_lossy()
-                .to_string(),
-        )
-        .interact_text()?
-        .into();
-
-    // Create if doesn't exist
-    if !dest.exists() {
+        // Confirm selection
         if Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!("Folder doesn't exist. Create {}?", dest.display()))
+            .with_prompt("Proceed with these files?")
             .default(true)
             .interact()?
         {
-            std::fs::create_dir_all(&dest).context("Failed to create destination folder")?;
-        } else {
-            // Retry
-            return step_select_destination();
+            return Ok(files);
         }
+        // Otherwise loop back and let them re-select
     }
+}
 
-    println!(
-        "\n{} Saving to: {}\n",
-        "✓".bright_green(),
-        dest.display().to_string().bright_white()
-    );
-    Ok(dest)
+fn step_select_destination() -> Result<PathBuf> {
+    loop {
+        println!(
+            "\n{} Where should I save the recovered files?",
+            "Step 4:".bright_yellow().bold()
+        );
+
+        let dest: PathBuf = Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter destination folder")
+            .with_initial_text(
+                dirs::document_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("Recovered Files")
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .interact_text()?
+            .into();
+
+        // Create if doesn't exist
+        if !dest.exists() {
+            if Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!("Folder doesn't exist. Create {}?", dest.display()))
+                .default(true)
+                .interact()?
+            {
+                std::fs::create_dir_all(&dest)
+                    .context("Failed to create destination folder")?;
+            } else {
+                continue; // retry destination selection
+            }
+        }
+
+        println!(
+            "\n{} Saving to: {}\n",
+            "✓".bright_green(),
+            dest.display().to_string().bright_white()
+        );
+        return Ok(dest);
+    }
 }
 
 async fn step_export_files(
     engine: &DrillEngine,
     files: &[String],
     dest: &std::path::Path,
-) -> Result<()> {
+) -> Result<crate::export::ExportResult> {
     println!(
         "{} Recovering your files...",
         "Step 5:".bright_yellow().bold()
@@ -594,7 +636,7 @@ async fn step_export_files(
             .template(
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
             )
-            .unwrap()
+            .expect("valid progress bar template")
             .progress_chars("█▓▒░"),
     );
 
@@ -627,7 +669,7 @@ async fn step_export_files(
                 "📊".bright_cyan(),
                 humansize::format_size(stats.total_bytes, humansize::BINARY)
             );
-            if let Some(manifest) = stats.manifest_path {
+            if let Some(ref manifest) = stats.manifest_path {
                 println!(
                     "  {} Manifest saved: {}",
                     "📋".bright_cyan(),
@@ -635,13 +677,13 @@ async fn step_export_files(
                 );
             }
             println!("{}", "═".repeat(50).bright_cyan());
+            Ok(stats)
         }
         Err(e) => {
             println!("\n{} Some errors occurred: {}", "⚠".yellow().bold(), e);
+            Err(e)
         }
     }
-
-    Ok(())
 }
 
 /// Step 6: Post-recovery satisfaction check with retry suggestions
@@ -659,7 +701,34 @@ async fn step_satisfaction_check() -> Result<()> {
             "✓".bright_green().bold(),
             "Great! Your files are safe now.".bright_green()
         );
-        println!("  Tip: Keep a backup of the recovered files in a second location!");
+        println!();
+        println!("  {} Next steps:", "💡".bright_yellow());
+        println!("    • Keep a backup of the recovered files in a second location");
+        println!(
+            "    • Use {} to scan for duplicates",
+            "diamond-drill dedup <path> --fuzzy".bright_cyan()
+        );
+        println!(
+            "    • Use {} for an interactive browser",
+            "diamond-drill tui <path>".bright_cyan()
+        );
+        println!(
+            "\n  {} Thank you for using Diamond Drill!",
+            "💎".bright_cyan()
+        );
+        println!(
+            "  {}",
+            "100% local. 100% private. 100% free.".bright_white()
+        );
+        println!();
+
+        // Pause so the user actually sees the message
+        Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Press Enter to exit")
+            .allow_empty(true)
+            .default(String::new())
+            .show_default(false)
+            .interact_text()?;
     } else {
         println!(
             "\n{} {}",

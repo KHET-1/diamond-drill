@@ -56,11 +56,12 @@ pub async fn run_tui(args: TuiArgs) -> Result<()> {
         };
         engine.index_with_progress(&index_args).await?;
 
-        // Populate file tree from indexed files
+        // Populate file tree and cached entries from indexed files
         let files = engine.get_all_files().await?;
         let paths: Vec<String> = files.iter().map(|p| p.to_string()).collect();
         app.file_tree = file_tree::FileTree::from_paths(&paths);
         app.file_count = paths.len();
+        app.cached_entries = engine.get_all_entries().await;
 
         app.state = AppState::Browse;
         app.status_message = format!("Indexed {} files from {}", app.file_count, source.display());

@@ -92,7 +92,7 @@ impl Scanner {
         let errors = Arc::new(AtomicUsize::new(0));
         let bad_sector_count = Arc::new(AtomicUsize::new(0));
 
-        // Collect directory entries first (single-threaded walk)
+        // Collect directory entries in a single pass (count dirs + collect files)
         let entries: Vec<DirEntry> = {
             let mut walker = WalkDir::new(&options.source)
                 .follow_links(false)
@@ -103,6 +103,8 @@ impl Scanner {
             }
 
             let source_path = options.source.clone();
+            let dirs_found_ref = Arc::clone(&dirs_found);
+
             walker
                 .into_iter()
                 .filter_entry(move |e| {
@@ -113,8 +115,14 @@ impl Scanner {
                     }
                 })
                 .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
                 .filter(|e| {
+                    if e.file_type().is_dir() {
+                        dirs_found_ref.fetch_add(1, Ordering::Relaxed);
+                        return false; // don't include dirs in the file list
+                    }
+                    if !e.file_type().is_file() {
+                        return false;
+                    }
                     if let Some(ref exts) = options.extensions {
                         e.path()
                             .extension()
@@ -131,15 +139,6 @@ impl Scanner {
                 })
                 .collect()
         };
-
-        dirs_found.fetch_add(
-            WalkDir::new(&options.source)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_dir())
-                .count(),
-            Ordering::Relaxed,
-        );
 
         // Process entries in parallel with rayon
         let (sender, receiver) = crossbeam_channel::bounded::<FileEntry>(1000);

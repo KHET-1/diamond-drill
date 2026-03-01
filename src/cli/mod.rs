@@ -66,6 +66,9 @@ pub enum Commands {
     /// Run the 5-agent swarm pipeline for parallel document processing
     Swarm(SwarmArgs),
 
+    /// Generate HTML/PDF recovery report from a manifest or export
+    Report(ReportArgs),
+
     /// Launch GUI mode (requires --features gui)
     #[cfg(feature = "gui")]
     Gui(GuiArgs),
@@ -179,10 +182,6 @@ pub struct PreviewArgs {
 pub struct InteractiveArgs {
     /// Source path to start with
     pub source: Option<PathBuf>,
-
-    /// State file to resume from
-    #[arg(long)]
-    pub state: Option<PathBuf>,
 
     /// Color theme (dark, light, auto)
     #[arg(long, default_value = "auto")]
@@ -443,4 +442,37 @@ pub enum SwarmReportFormat {
     Human,
     /// JSON output
     Json,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct ReportArgs {
+    /// Path to an export manifest (diamond-drill-manifest.json)
+    #[arg(required = true)]
+    pub manifest: PathBuf,
+
+    /// Output path for the report (default: report.html next to manifest)
+    #[arg(long, short)]
+    pub output: Option<PathBuf>,
+
+    /// Report format
+    #[arg(long, value_enum, default_value = "html")]
+    pub format: ReportFormat,
+
+    /// Custom report title
+    #[arg(long)]
+    pub title: Option<String>,
+
+    /// Open report in browser after generation
+    #[arg(long, default_value = "true")]
+    pub open: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ReportFormat {
+    /// Self-contained HTML report with dark glassmorphic theme
+    Html,
+    /// PDF report with summary and chain of custody
+    Pdf,
+    /// Generate both HTML and PDF
+    Both,
 }

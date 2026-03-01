@@ -30,8 +30,71 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Index(args)) => {
+            use colored::Colorize;
+            use indicatif::{ProgressBar, ProgressStyle};
+
+            println!(
+                "\n{} Indexing: {}",
+                "💎".bright_cyan(),
+                args.source.display().to_string().bright_white()
+            );
+
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.cyan} [{elapsed_precise}] {msg}")
+                    .expect("valid progress bar template"),
+            );
+            pb.set_message("Scanning files...");
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
             let engine = DrillEngine::new(args.source.clone()).await?;
             engine.index_with_progress(&args).await?;
+
+            let file_count = engine.file_count().await;
+            let bad_sector_count = engine.bad_sector_count().await;
+            pb.finish_with_message(format!(
+                "{} Indexed {} files{}",
+                "✓".bright_green(),
+                file_count,
+                if bad_sector_count > 0 {
+                    format!(" ({} bad sectors detected)", bad_sector_count)
+                } else {
+                    String::new()
+                }
+            ));
+
+            // Write bad sector report if requested
+            if let Some(ref report_path) = args.bad_sector_report {
+                let bad_sectors = engine.get_bad_sectors().await;
+                let entries = engine.get_all_entries().await;
+                let report = diamond_drill::badsector::generate_report(
+                    &args.source,
+                    &[], // sector maps not available from index scan
+                    entries.len(),
+                );
+                // Build report from the BadSector vec in the engine
+                let bsr = diamond_drill::badsector::BadSectorReport {
+                    source: args.source.clone(),
+                    scan_time: chrono::Utc::now(),
+                    total_files_scanned: entries.len(),
+                    files_with_bad_sectors: bad_sectors.len(),
+                    total_bad_blocks: bad_sectors.len() as u64,
+                    total_bad_bytes: bad_sectors.iter().map(|b| b.length).sum(),
+                    files: Vec::new(), // full sector maps require SectorReader pass
+                };
+                let is_json = report_path
+                    .extension()
+                    .map(|e| e == "json")
+                    .unwrap_or(false);
+                diamond_drill::badsector::write_report(&bsr, report_path, is_json)?;
+                println!(
+                    "  {} Bad sector report: {}",
+                    "📋".bright_cyan(),
+                    report_path.display().to_string().bright_white()
+                );
+                let _ = report; // suppress unused
+            }
         }
         Some(Commands::Search(args)) => {
             let engine = DrillEngine::load_or_create(&args.source).await?;
@@ -114,10 +177,33 @@ async fn main() -> Result<()> {
             }
 
             let result = swarm::run_swarm_with_config(config)?;
-            println!(
-                "Swarm complete: {} files, {} errors",
-                result.files_scanned, result.errors_encountered
-            );
+
+            match args.report {
+                cli::SwarmReportFormat::Human => {
+                    println!(
+                        "Swarm complete: {} files scanned, {} chunks, {} embeddings",
+                        result.files_scanned, result.chunks_created, result.embeddings_generated
+                    );
+                    println!(
+                        "  {} heals, {} exports, {} processed",
+                        result.heals_performed,
+                        result.exports_completed,
+                        humansize::format_size(result.bytes_processed, humansize::BINARY),
+                    );
+                    if result.errors_encountered > 0 {
+                        println!(
+                            "  {} errors ({} healed)",
+                            result.errors_encountered, result.errors_healed
+                        );
+                    }
+                }
+                cli::SwarmReportFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+            }
+        }
+        Some(Commands::Report(args)) => {
+            run_report(args)?;
         }
         Some(Commands::Tui(args)) => {
             diamond_drill::tui::run_tui(args).await?;
@@ -193,7 +279,7 @@ async fn run_carve(args: cli::CarveArgs) -> Result<()> {
                 .template(
                     "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
                 )
-                .unwrap()
+                .expect("valid progress bar template")
                 .progress_chars("█▓▒░"),
         );
         pb.set_message("Scanning...");
@@ -291,6 +377,70 @@ async fn run_carve(args: cli::CarveArgs) -> Result<()> {
         }
     }
     println!("{}", "═".repeat(60).bright_cyan());
+    Ok(())
+}
+
+fn run_report(args: cli::ReportArgs) -> Result<()> {
+    use colored::Colorize;
+    use diamond_drill::report;
+
+    println!(
+        "\n{} Generating recovery report from: {}",
+        "💎".bright_cyan(),
+        args.manifest.display().to_string().bright_white()
+    );
+
+    let mut data = report::report_data_from_manifest(&args.manifest)?;
+
+    if let Some(title) = args.title {
+        data.title = title;
+    }
+
+    let base_path = args.manifest.parent().unwrap_or(std::path::Path::new("."));
+
+    let open_browser = args.open;
+
+    match args.format {
+        cli::ReportFormat::Html => {
+            let output = args
+                .output
+                .unwrap_or_else(|| base_path.join("diamond-drill-report.html"));
+            report::save_html_report(&data, &output, open_browser)?;
+            println!(
+                "  {} HTML report saved to: {}",
+                "✓".bright_green().bold(),
+                output.display().to_string().bright_white()
+            );
+        }
+        cli::ReportFormat::Pdf => {
+            let output = args
+                .output
+                .unwrap_or_else(|| base_path.join("diamond-drill-report.pdf"));
+            report::generate_pdf_report(&data, &output)?;
+            println!(
+                "  {} PDF report saved to: {}",
+                "✓".bright_green().bold(),
+                output.display().to_string().bright_white()
+            );
+        }
+        cli::ReportFormat::Both => {
+            let html_path = base_path.join("diamond-drill-report.html");
+            let pdf_path = base_path.join("diamond-drill-report.pdf");
+            report::save_html_report(&data, &html_path, open_browser)?;
+            report::generate_pdf_report(&data, &pdf_path)?;
+            println!(
+                "  {} HTML report: {}",
+                "✓".bright_green().bold(),
+                html_path.display().to_string().bright_white()
+            );
+            println!(
+                "  {} PDF report: {}",
+                "✓".bright_green().bold(),
+                pdf_path.display().to_string().bright_white()
+            );
+        }
+    }
+
     Ok(())
 }
 
