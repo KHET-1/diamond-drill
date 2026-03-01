@@ -39,6 +39,8 @@ pub async fn run_tui(args: TuiArgs) -> Result<()> {
         app.status_message = format!("Indexing {}...", source.display());
         app.state = AppState::Indexing;
 
+        let index_start = std::time::Instant::now();
+
         // Index synchronously before entering the event loop
         let engine = DrillEngine::new(source.clone()).await?;
         let index_args = crate::cli::IndexArgs {
@@ -62,9 +64,18 @@ pub async fn run_tui(args: TuiArgs) -> Result<()> {
         app.file_tree = file_tree::FileTree::from_paths(&paths);
         app.file_count = paths.len();
         app.cached_entries = engine.get_all_entries().await;
+        app.index_elapsed = index_start.elapsed();
+
+        // Compute file type distribution stats
+        app.compute_stats();
 
         app.state = AppState::Browse;
-        app.status_message = format!("Indexed {} files from {}", app.file_count, source.display());
+        app.status_message = format!(
+            "Indexed {} files ({}) in {:.1}s",
+            app.file_count,
+            humansize::format_size(app.total_size, humansize::BINARY),
+            app.index_elapsed.as_secs_f64(),
+        );
     }
 
     // Run main loop

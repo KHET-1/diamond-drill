@@ -144,75 +144,78 @@ impl RecoveryScenario {
 
 /// Run the easy mode interactive workflow
 pub async fn run_easy_mode() -> Result<()> {
-    let term = Term::stdout();
-    term.clear_screen()?;
+    // Loop instead of recursion to avoid stack overflow on repeated retries
+    loop {
+        let term = Term::stdout();
+        term.clear_screen()?;
 
-    print_banner();
+        print_banner();
 
-    println!(
-        "\n{}\n",
-        "Welcome to Diamond Drill Easy Mode! 💎"
-            .bright_cyan()
-            .bold()
-    );
-    println!("I'll guide you through recovering your files step by step.\n");
+        println!(
+            "\n{}\n",
+            "Welcome to Diamond Drill Easy Mode! 💎"
+                .bright_cyan()
+                .bold()
+        );
+        println!("I'll guide you through recovering your files step by step.\n");
 
-    // Step 0: What happened?
-    let scenario = step_what_happened()?;
+        // Step 0: What happened?
+        let scenario = step_what_happened()?;
 
-    // Step 1: Select source
-    let source = step_select_source()?;
+        // Step 1: Select source
+        let source = step_select_source()?;
 
-    // Step 2: Index the source (with scenario-aware config)
-    let engine = step_index_source(&source, scenario).await?;
+        // Step 2: Index the source (with scenario-aware config)
+        let engine = step_index_source(&source, scenario).await?;
 
-    // Step 3: Find files
-    let selected_files = step_find_files(&engine).await?;
+        // Step 3: Find files
+        let selected_files = step_find_files(&engine).await?;
 
-    if selected_files.is_empty() {
-        println!("\n{}", "No files selected. Exiting.".yellow());
-        return Ok(());
-    }
+        if selected_files.is_empty() {
+            println!("\n{}", "No files selected. Exiting.".yellow());
+            return Ok(());
+        }
 
-    // Step 4: Select destination
-    let dest = step_select_destination()?;
+        // Step 4: Select destination
+        let dest = step_select_destination()?;
 
-    // Step 5: Export
-    let export_result = step_export_files(&engine, &selected_files, &dest).await?;
+        // Step 5: Export
+        let export_result = step_export_files(&engine, &selected_files, &dest).await?;
 
-    // Auto-generate HTML report if export succeeded and manifest was created
-    if let Some(ref manifest_path) = export_result.manifest_path {
-        let report_path = dest.join("diamond-drill-report.html");
-        match crate::report::report_data_from_manifest(manifest_path) {
-            Ok(report_data) => {
-                // Don't use save_html_report (which opens browser) — just write file
-                let html = crate::report::generate_html_report(&report_data);
-                if let Err(e) = std::fs::write(&report_path, html.as_bytes()) {
-                    tracing::warn!("Could not write recovery report: {}", e);
-                } else {
-                    println!(
-                        "  {} Recovery report: {}",
-                        "📊".bright_cyan(),
-                        report_path.display().to_string().bright_white()
-                    );
+        // Auto-generate HTML report if export succeeded and manifest was created
+        if let Some(ref manifest_path) = export_result.manifest_path {
+            let report_path = dest.join("diamond-drill-report.html");
+            match crate::report::report_data_from_manifest(manifest_path) {
+                Ok(report_data) => {
+                    // Don't use save_html_report (which opens browser) — just write file
+                    let html = crate::report::generate_html_report(&report_data);
+                    if let Err(e) = std::fs::write(&report_path, html.as_bytes()) {
+                        tracing::warn!("Could not write recovery report: {}", e);
+                    } else {
+                        println!(
+                            "  {} Recovery report: {}",
+                            "📊".bright_cyan(),
+                            report_path.display().to_string().bright_white()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not generate report: {}", e);
                 }
             }
-            Err(e) => {
-                tracing::warn!("Could not generate report: {}", e);
-            }
+        }
+
+        println!(
+            "\n{} {}",
+            "✓".bright_green().bold(),
+            "Recovery complete! Your files are safe.".bright_green()
+        );
+
+        // Step 6: Satisfaction check — returns true if user wants to run again
+        if !step_satisfaction_check_should_retry().await? {
+            return Ok(());
         }
     }
-
-    println!(
-        "\n{} {}",
-        "✓".bright_green().bold(),
-        "Recovery complete! Your files are safe.".bright_green()
-    );
-
-    // Step 6: Satisfaction check
-    step_satisfaction_check().await?;
-
-    Ok(())
 }
 
 /// Step 0: Ask what happened to guide scanning
@@ -686,8 +689,8 @@ async fn step_export_files(
     }
 }
 
-/// Step 6: Post-recovery satisfaction check with retry suggestions
-async fn step_satisfaction_check() -> Result<()> {
+/// Step 6: Post-recovery satisfaction check — returns true if user wants to retry
+async fn step_satisfaction_check_should_retry() -> Result<bool> {
     println!("\n{} Did it work?", "Step 6:".bright_yellow().bold());
 
     let satisfied = Confirm::with_theme(&ColorfulTheme::default())
@@ -729,6 +732,7 @@ async fn step_satisfaction_check() -> Result<()> {
             .default(String::new())
             .show_default(false)
             .interact_text()?;
+        Ok(false) // don't retry
     } else {
         println!(
             "\n{} {}",
@@ -754,12 +758,8 @@ async fn step_satisfaction_check() -> Result<()> {
             .default(false)
             .interact()?;
 
-        if retry {
-            return Box::pin(run_easy_mode()).await;
-        }
+        Ok(retry)
     }
-
-    Ok(())
 }
 
 /// List available drives (Windows-specific, stub for other platforms)
@@ -779,15 +779,30 @@ fn list_available_drives() -> Vec<String> {
     #[cfg(not(target_os = "windows"))]
     {
         // On Unix, list mounted volumes
+        // /media/<user>/<drive> needs two-level traversal
         let mut drives = vec![String::from("/")];
-        if let Ok(entries) = std::fs::read_dir("/media") {
-            for entry in entries.flatten() {
-                drives.push(entry.path().to_string_lossy().to_string());
-            }
-        }
-        if let Ok(entries) = std::fs::read_dir("/mnt") {
-            for entry in entries.flatten() {
-                drives.push(entry.path().to_string_lossy().to_string());
+        for base in &["/media", "/mnt", "/run/media"] {
+            if let Ok(entries) = std::fs::read_dir(base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        // Check if this is a mount point directly (e.g., /mnt/data)
+                        // or a user dir containing mounts (e.g., /media/rathin/)
+                        let mut has_subdirs = false;
+                        if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                            for sub in sub_entries.flatten() {
+                                if sub.path().is_dir() {
+                                    has_subdirs = true;
+                                    drives.push(sub.path().to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                        // If no subdirs, it's likely a direct mount point
+                        if !has_subdirs {
+                            drives.push(path.to_string_lossy().to_string());
+                        }
+                    }
+                }
             }
         }
         drives

@@ -1,5 +1,6 @@
 //! App state - Central state management for the TUI
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -8,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use super::file_tree::FileTree;
 use crate::badsector::SectorMap;
 use crate::cli::TuiArgs;
+use crate::core::FileType;
 use crate::dedup::{DedupOptions, DedupReport};
 
 /// Current view/tab in the TUI
@@ -130,6 +132,18 @@ pub struct App {
     pub bad_sector_scroll: usize,
     /// Cached file entries for dedup operations
     pub cached_entries: Vec<crate::core::FileEntry>,
+    /// File type distribution counts
+    pub type_counts: HashMap<FileType, usize>,
+    /// File type distribution sizes
+    pub type_sizes: HashMap<FileType, u64>,
+    /// Total size of all indexed files
+    pub total_size: u64,
+    /// Total size of selected files
+    pub selected_size: u64,
+    /// Source display name
+    pub source_label: String,
+    /// Elapsed time for indexing
+    pub index_elapsed: std::time::Duration,
 }
 
 impl App {
@@ -152,7 +166,7 @@ impl App {
             tab: Tab::Files,
             should_quit: false,
             show_help: false,
-            source,
+            source: source.clone(),
             file_tree,
             file_count,
             selected_files: Vec::new(),
@@ -164,7 +178,42 @@ impl App {
             bad_sector_maps: Vec::new(),
             bad_sector_scroll: 0,
             cached_entries: Vec::new(),
+            type_counts: HashMap::new(),
+            type_sizes: HashMap::new(),
+            total_size: 0,
+            selected_size: 0,
+            source_label: source
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "No source".to_string()),
+            index_elapsed: std::time::Duration::ZERO,
         })
+    }
+
+    /// Compute file type distribution stats from cached entries
+    pub fn compute_stats(&mut self) {
+        self.type_counts.clear();
+        self.type_sizes.clear();
+        self.total_size = 0;
+        for entry in &self.cached_entries {
+            *self.type_counts.entry(entry.file_type).or_insert(0) += 1;
+            *self.type_sizes.entry(entry.file_type).or_insert(0) += entry.size;
+            self.total_size += entry.size;
+        }
+    }
+
+    /// Recompute selected_size from selected_files
+    fn update_selected_size(&mut self) {
+        self.selected_size = self
+            .cached_entries
+            .iter()
+            .filter(|e| {
+                self.selected_files
+                    .iter()
+                    .any(|s| e.path.to_string_lossy().as_ref() == s.as_str())
+            })
+            .map(|e| e.size)
+            .sum();
     }
 
     /// Global key handler
@@ -374,6 +423,7 @@ impl App {
             } else {
                 self.selected_files.push(path);
             }
+            self.update_selected_size();
             self.status_message = format!("{} files selected", self.selected_files.len());
         }
     }
@@ -385,12 +435,14 @@ impl App {
                 self.selected_files.push(node.path.clone());
             }
         }
+        self.update_selected_size();
         self.status_message = format!("All {} files selected", self.selected_files.len());
     }
 
     /// Clear selection
     pub fn select_none(&mut self) {
         self.selected_files.clear();
+        self.selected_size = 0;
         self.status_message = "Selection cleared".to_string();
     }
 
